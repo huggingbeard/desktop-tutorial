@@ -222,9 +222,17 @@ def start_new_topic(client: OpenAI) -> Optional[str]:
     intro = intro_template.format(name=name)
     
     # Ask LLM to generate a natural opening question for this topic
-    prompt = f"""{intro} Generate a natural, specific opening question about {name}'s {TOPIC_METADATA[topic_id]['label'].lower()}.
+    prompt = f"""You are the interviewer conducting this performance review. 
 
-Make it conversational and specific - ask about recent examples or observable behaviors."""
+Start the {TOPIC_METADATA[topic_id]['label'].lower()} section with: "{intro}"
+
+Then immediately ask a specific, natural question about {name}'s {TOPIC_METADATA[topic_id]['label'].lower()}.
+
+DO NOT say things like "Sure!", "How about this:", or "Here's a question:". 
+DO NOT offer multiple options or suggest questions.
+Just state the intro and ask your question directly as the interviewer.
+
+Make it conversational and ask about recent examples or observable behaviors."""
     
     try:
         r = client.chat.completions.create(
@@ -233,11 +241,9 @@ Make it conversational and specific - ask about recent examples or observable be
             max_tokens=100,
             temperature=0.7,
         )
-        question = r.choices[0].message.content.strip()
-        return f"{intro} {question}"
+        return r.choices[0].message.content.strip()
     except Exception:
         return f"{intro} What have you observed about {name} in this area?"
-
 
 # ---------- EXPORT ----------
 def build_topic_csv(persona: str) -> bytes:
