@@ -348,29 +348,13 @@ def detailed_enough(client: OpenAI, topic_label: str, last_user_texts: str) -> b
 def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optional[str] = None) -> str:
     """Always generate a QUESTION, never a statement."""
     name = st.session_state.employee_name
-    persona_desc = PERSONA_OPTIONS.get(persona, persona.lower())
     mirror_prefix = build_mirror_prefix()
-    progress_brief = build_progress_brief()
     attempts = 0
     if topic_id:
         attempts = st.session_state.topic_depth.get(topic_id, 0)
     if mode == "opening":
         template = random.choice(OPENING_QUESTION_BANK)
         return template.format(name=name)
-    base = [
-        {"role": "system", "content": (
-            "You are conducting a structured performance interview. "
-            "Your job is to ask ONE short, natural, conversational question. "
-            "Never make statements, never summarize, never say what the employee is like — only ask questions. "
-            "Speak like a colleague, not HR. Avoid phrases like 'can you share' or 'could you elaborate'. "
-            "Use direct, plain English."
-        )},
-        {"role": "system", "content": f"Participant: {persona_desc}. Employee: {name}."},
-        {"role": "system", "content": (
-            "Progress so far: " + progress_brief +
-            ". Keep it human, acknowledge when a topic seems covered, and do not repeat the same ask."
-        )},
-    ]
     if mode == "topic" and topic_id:
         templates = TOPIC_QUESTION_BANK.get(topic_id, [])
         if templates:
@@ -385,12 +369,7 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
         q = f"{mirror_prefix}Before we wrap, is there anything about working with {name} that you'd want the review team to know?"
     if attempts >= MAX_TOPIC_ATTEMPTS - 1 and mode == "topic" and topic_id:
         q = f"{mirror_prefix}Is there anything else worth noting about {name}'s {TOPIC_METADATA[topic_id]['label'].lower()}, or should we move on?"
-    # new clear directive to force question-only output
-    messages = base + [
-        {"role": "user", "content": f"Generate only the next question to ask the participant: {q}"}
-    ]
-    r = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=120)
-    return r.choices[0].message.content.strip()
+    return q.strip()
 
 
 def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
