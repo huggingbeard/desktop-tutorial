@@ -1,7 +1,9 @@
+from __future__ import annotations
 """Interactive Streamlit app for an LLM-guided interview assistant.
 Revised 2025-10-19 for smoother UX and cleaner logic.
+""""""Interactive Streamlit app for an LLM-guided interview assistant.
+Revised 2025-10-19 for smoother UX and cleaner logic.
 """
-from __future__ import annotations
 
 import csv
 import io
