@@ -1,8 +1,7 @@
 from __future__ import annotations
 """Interactive Streamlit app for an LLM-guided interview assistant.
-Revised 2025-10-19 for smoother UX and cleaner logic.
+Sharper topic detection + .txt transcript export (2025-10-19)
 """
-
 import csv, io, json, os
 from typing import Dict, List, Sequence
 import streamlit as st
@@ -199,4 +198,3 @@ def main()->None:
             data=st.session_state.txt_bytes,file_name="interview_transcript.txt",mime="text/plain")
 
 if __name__=="__main__": main()
-    main()
