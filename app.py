@@ -66,6 +66,7 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.txt_bytes: Optional[bytes] = None
     st.session_state.pending_inputs: List[str] = []
     st.session_state.processing_stage: str = "idle"
+    st.session_state.awaiting_final_comment = False
     st.session_state.interview_complete = False
 
 
@@ -316,6 +317,13 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
     if st.session_state.finalized or st.session_state.interview_complete:
         return
     
+    # Handle final comment after "anything else?" question
+    if st.session_state.awaiting_final_comment:
+        assistant_response, _, insights = generate_llm_response(client, user_text)
+        append_assistant_message(assistant_response)
+        st.session_state.interview_complete = True
+        return
+    
     current_topic = current_topic_id()
     
     # Generate LLM response and get decision
@@ -337,9 +345,9 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
         st.session_state.current_topic_index += 1
         st.session_state.responses_this_topic = 0
         
-        # Check if interview is complete
+        # Check if we've moved past all topics
         if st.session_state.current_topic_index >= len(TOPIC_SEQUENCE):
-            st.session_state.interview_complete = True
+            st.session_state.awaiting_final_comment = True
 
 
 def process_pending_inputs_if_ready(client: OpenAI, persona: str) -> tuple[bool, str]:
