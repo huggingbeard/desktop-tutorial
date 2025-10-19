@@ -31,13 +31,13 @@ TOPIC_ORDER = ["leadership", "technical_competence", "team_orientation"]
 
 TOPIC_QUESTION_BANK = {
     "leadership": [
-        "{mirror}When have you seen {name} take the lead or steady the group?",
+        "{mirror}Where have you seen {name} take the lead or steady the group lately?",
         "{mirror}How does {name} rally people when the team needs direction?",
-        "{mirror}What does {name} do when things get messy and someone has to steer?",
+        "{mirror}What's a moment when {name} stepped in to steer the team?",
     ],
     "technical_competence": [
-        "{mirror}Can you walk me through a recent moment where {name}'s technical judgment made the difference?",
-        "{mirror}What recent project shows {name}'s technical chops in action?",
+        "{mirror}Walk me through a recent moment where {name}'s technical judgment made the difference.",
+        "{mirror}Tell me about a project that shows {name}'s technical chops in action.",
         "{mirror}When did {name}'s build-or-fix skills really save the day lately?",
     ],
     "team_orientation": [
@@ -46,6 +46,8 @@ TOPIC_QUESTION_BANK = {
         "{mirror}What's a recent moment that captures how {name} supports everyone else?",
     ],
 }
+
+FOLLOWUP_TOPICS = {"technical_competence", "team_orientation"}
 
 STOPWORDS = {
     "the",
@@ -124,6 +126,40 @@ def build_mirror_prefix() -> str:
         return ""
     return f'You mentioned "{fragment}" earlier. '
 
+
+def record_topic_notes(user_text: str, notes_by_topic: Dict[str, List[str]]) -> None:
+    for topic_id, notes in notes_by_topic.items():
+        st.session_state.topic_notes.setdefault(topic_id, []).append(
+            {"notes": notes, "verbatim": user_text}
+        )
+
+
+TOPIC_REJECTION_PATTERNS = {
+    "leadership": [r"\bnot a leader\b", r"\bno leadership\b"],
+    "technical_competence": [r"\bnot technical\b", r"\bno technical skills\b"],
+    "team_orientation": [r"\bnot (?:a )?team player\b", r"\bno teamwork\b"],
+}
+
+
+def detect_topic_rejection(user_text: str) -> Optional[str]:
+    lowered = user_text.lower()
+    for topic_id, patterns in TOPIC_REJECTION_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, lowered):
+                return topic_id
+    return None
+
+
+def user_wants_to_stop(user_text: str) -> bool:
+    lowered = user_text.strip().lower()
+    return lowered in {"no we are done", "no we're done", "we're done", "we are done"}
+
+
+def append_assistant_message(content: str) -> None:
+    message = {"role": "assistant", "content": content}
+    st.session_state.messages.append(message)
+    st.session_state.llm_history.append(message)
+
 # ---------- OPENAI ----------
 @st.cache_resource(show_spinner=False)
 def get_openai_client(api_key: str) -> OpenAI:
@@ -158,7 +194,13 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.csv_bytes: Optional[bytes] = None
     st.session_state.txt_bytes: Optional[bytes] = None
     st.session_state.last_topic: Optional[str] = None
+    st.session_state.last_mode: Optional[str] = None
     st.session_state.topic_depth: Dict[str, int] = {t: 0 for t in TOPIC_METADATA}
+    st.session_state.rejected_topics: set[str] = set()
+    st.session_state.pending_ack_topic: Optional[str] = None
+    st.session_state.followups_sent: set[str] = set()
+    st.session_state.no_more_questions = False
+    st.session_state.closing_declined = False
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -246,6 +288,85 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
     ]
     r = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=120)
     return r.choices[0].message.content.strip()
+
+
+def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
+    if st.session_state.finalized:
+        return
+
+    rejection_topic = detect_topic_rejection(user_text)
+    if rejection_topic and rejection_topic not in st.session_state.covered_topics:
+        st.session_state.rejected_topics.add(rejection_topic)
+        st.session_state.covered_topics.add(rejection_topic)
+        st.session_state.topic_notes[rejection_topic].append({
+            "notes": ["Participant declined to discuss this topic."],
+            "verbatim": user_text,
+        })
+        st.session_state.pending_ack_topic = rejection_topic
+
+    notes = analyze_user_response(client, user_text)
+    if notes:
+        record_topic_notes(user_text, notes)
+
+    last_topic = st.session_state.last_topic
+
+    for topic_id in notes:
+        if topic_id != last_topic:
+            mark_topic_covered(topic_id)
+    send_followup = False
+
+    if last_topic:
+        if last_topic in FOLLOWUP_TOPICS and last_topic not in st.session_state.followups_sent:
+            if check_if_vague(client, user_text):
+                send_followup = True
+                st.session_state.followups_sent.add(last_topic)
+            elif detailed_enough(client, TOPIC_METADATA[last_topic]['label'], user_text):
+                mark_topic_covered(last_topic)
+        else:
+            if detailed_enough(client, TOPIC_METADATA[last_topic]['label'], user_text):
+                mark_topic_covered(last_topic)
+
+    if user_wants_to_stop(user_text):
+        st.session_state.no_more_questions = True
+        st.session_state.closing_declined = True
+        append_assistant_message("Understood. We'll stop here.")
+        return
+
+    if st.session_state.last_mode == "closing":
+        st.session_state.no_more_questions = True
+
+    if st.session_state.no_more_questions:
+        return
+
+    if st.session_state.pending_ack_topic:
+        topic_id = st.session_state.pending_ack_topic
+        label = TOPIC_METADATA[topic_id]["label"]
+        append_assistant_message(f"Got it, we'll skip {label.lower()}.")
+        st.session_state.pending_ack_topic = None
+
+    if send_followup and last_topic:
+        question = generate_question(client, persona, mode="followup", topic_id=last_topic)
+        append_assistant_message(question)
+        st.session_state.last_mode = "followup"
+        return
+
+    next_topic = pick_initial_or_next_topic()
+    if next_topic:
+        question = generate_question(client, persona, mode="topic", topic_id=next_topic)
+        append_assistant_message(question)
+        st.session_state.last_topic = next_topic
+        st.session_state.last_mode = "topic"
+        st.session_state.topic_depth[next_topic] += 1
+        return
+
+    if st.session_state.closing_declined:
+        st.session_state.no_more_questions = True
+        return
+
+    question = generate_question(client, persona, mode="closing")
+    append_assistant_message(question)
+    st.session_state.last_mode = "closing"
+    st.session_state.last_topic = None
 
 # ---------- ANALYSIS ----------
 def analyze_user_response(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
@@ -336,18 +457,10 @@ def main():
         or st.session_state.persona != persona
         or st.session_state.get("employee_name") != employee_name):
         initialize_session(persona, employee_name)
-
-    # Hard-wired, human-sounding opening question
-        if persona == "Self":
-            opening_q = "Tell me about your strengths at work."
-        else:
-            opening_q = f"Tell me about {employee_name}'s strengths."
-
-        st.session_state.messages.append({"role": "assistant", "content": opening_q})
-        st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
-
-        st.session_state.messages.append({"role": "assistant", "content": opening_q})
-        st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
+        opening_q = generate_question(client, persona, mode="opening")
+        append_assistant_message(opening_q)
+        st.session_state.last_mode = "opening"
+        st.session_state.last_topic = None
 
     with st.sidebar:
         st.header("Topic Coverage")
@@ -366,7 +479,7 @@ def main():
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
             st.session_state.llm_history.append({"role": "user", "content": user_text})
-            # (rest of logic unchanged from your last working version)
+            handle_user_response(client, persona, user_text)
             st.rerun()
 
         if len(st.session_state.messages) > 3:
