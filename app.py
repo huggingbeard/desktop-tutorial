@@ -1,9 +1,8 @@
 from __future__ import annotations
 """ZEPHYRON Interview Assistant
 Natural tone + learning flow:
-- Hard-wired first question ("Tell me about your/X's strengths")
 - Tracks topic depth (default 2, up to 3 if not detailed with examples)
-- Marks topics N/A when irrelevant ("not a leader")
+- Marks topics N/A on explicit rejection (e.g., 'not a leader')
 - One concise follow-up for technical/team if vague
 - Avoids repeating earlier questions; moves on once a topic is done
 """
@@ -12,6 +11,8 @@ import csv
 import io
 import json
 import os
+import random
+import re
 from typing import Dict, List, Sequence, Optional
 
 import streamlit as st
@@ -27,6 +28,137 @@ TOPIC_METADATA = {
     "team_orientation": {"label": "Team Orientation"},
 }
 TOPIC_ORDER = ["leadership", "technical_competence", "team_orientation"]
+
+TOPIC_QUESTION_BANK = {
+    "leadership": [
+        "{mirror}Where have you seen {name} take the lead or steady the group lately?",
+        "{mirror}How does {name} rally people when the team needs direction?",
+        "{mirror}What's a moment when {name} stepped in to steer the team?",
+    ],
+    "technical_competence": [
+        "{mirror}Walk me through a recent moment where {name}'s technical judgment made the difference.",
+        "{mirror}Tell me about a project that shows {name}'s technical chops in action.",
+        "{mirror}When did {name}'s build-or-fix skills really save the day lately?",
+    ],
+    "team_orientation": [
+        "{mirror}What does working with {name} feel like when the team is under pressure?",
+        "{mirror}Who benefits most from {name}'s way of showing up for the team?",
+        "{mirror}What's a recent moment that captures how {name} supports everyone else?",
+    ],
+}
+
+FOLLOWUP_TOPICS = {"technical_competence", "team_orientation"}
+
+STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "that",
+    "with",
+    "have",
+    "this",
+    "from",
+    "they",
+    "their",
+    "about",
+    "been",
+    "your",
+    "when",
+    "what",
+    "where",
+    "which",
+    "because",
+    "while",
+    "there",
+    "really",
+    "just",
+    "like",
+    "maybe",
+    "very",
+    "were",
+    "also",
+    "into",
+    "those",
+    "these",
+    "through",
+    "still",
+    "even",
+    "could",
+    "should",
+    "would",
+    "does",
+    "don't",
+    "didn't",
+    "can't",
+    "isn't",
+    "wasn't",
+    "aren't",
+    "won't",
+    "hasn't",
+}
+
+
+def extract_mirror_fragment() -> Optional[str]:
+    if "llm_history" not in st.session_state:
+        return None
+    for entry in reversed(st.session_state.llm_history):
+        if entry.get("role") != "user":
+            continue
+        text = entry.get("content", "").strip()
+        if not text:
+            continue
+        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+        for sentence in reversed(sentences):
+            cleaned = sentence.strip()
+            if cleaned:
+                snippet = cleaned[:80]
+                return snippet
+        words = re.findall(r"[A-Za-z0-9'-]+", text)
+        keywords = [w for w in words if len(w) > 3 and w.lower() not in STOPWORDS]
+        if keywords:
+            return " ".join(keywords[:3])[:80]
+    return None
+
+
+def build_mirror_prefix() -> str:
+    fragment = extract_mirror_fragment()
+    if not fragment:
+        return ""
+    return f'You mentioned "{fragment}" earlier. '
+
+
+def record_topic_notes(user_text: str, notes_by_topic: Dict[str, List[str]]) -> None:
+    for topic_id, notes in notes_by_topic.items():
+        st.session_state.topic_notes.setdefault(topic_id, []).append(
+            {"notes": notes, "verbatim": user_text}
+        )
+
+
+TOPIC_REJECTION_PATTERNS = {
+    "leadership": [r"\bnot a leader\b", r"\bno leadership\b"],
+    "technical_competence": [r"\bnot technical\b", r"\bno technical skills\b"],
+    "team_orientation": [r"\bnot (?:a )?team player\b", r"\bno teamwork\b"],
+}
+
+
+def detect_topic_rejection(user_text: str) -> Optional[str]:
+    lowered = user_text.lower()
+    for topic_id, patterns in TOPIC_REJECTION_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, lowered):
+                return topic_id
+    return None
+
+
+def user_wants_to_stop(user_text: str) -> bool:
+    lowered = user_text.strip().lower()
+    return lowered in {"no we are done", "no we're done", "we're done", "we are done"}
+
+
+def append_assistant_message(content: str) -> None:
+    message = {"role": "assistant", "content": content}
+    st.session_state.messages.append(message)
+    st.session_state.llm_history.append(message)
 
 # ---------- OPENAI ----------
 @st.cache_resource(show_spinner=False)
@@ -62,8 +194,13 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.csv_bytes: Optional[bytes] = None
     st.session_state.txt_bytes: Optional[bytes] = None
     st.session_state.last_topic: Optional[str] = None
+    st.session_state.last_mode: Optional[str] = None
     st.session_state.topic_depth: Dict[str, int] = {t: 0 for t in TOPIC_METADATA}
-    st.session_state.started = False
+    st.session_state.rejected_topics: set[str] = set()
+    st.session_state.pending_ack_topic: Optional[str] = None
+    st.session_state.followups_sent: set[str] = set()
+    st.session_state.no_more_questions = False
+    st.session_state.closing_declined = False
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -115,11 +252,12 @@ def detailed_enough(client: OpenAI, topic_label: str, last_user_texts: str) -> b
     except Exception:
         return False
 
-# ---------- QUESTION GENERATOR ----------
+# ---------- FIXED FUNCTION ----------
 def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optional[str] = None) -> str:
     """Always generate a QUESTION, never a statement."""
     name = st.session_state.employee_name
     persona_desc = PERSONA_OPTIONS.get(persona, persona.lower())
+    mirror_prefix = build_mirror_prefix()
     base = [
         {"role": "system", "content": (
             "You are conducting a structured performance interview. "
@@ -130,23 +268,105 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
         )},
         {"role": "system", "content": f"Participant: {persona_desc}. Employee: {name}."},
     ]
-    if mode == "topic" and topic_id:
-        if topic_id == "leadership":
-            q = f"How does {name} handle leadership or influence on the team?"
-        elif topic_id == "technical_competence":
-            q = f"How strong are {name}'s technical skills? Any concrete example?"
+    if mode == "opening":
+        q = f"What are {name}'s main strengths at work?"
+    elif mode == "topic" and topic_id:
+        templates = TOPIC_QUESTION_BANK.get(topic_id, [])
+        if templates:
+            template = random.choice(templates)
+            q = template.format(name=name, mirror=mirror_prefix)
         else:
-            q = f"What is {name} like to work with day to day? Any instance that shows their teamwork?"
+            q = f"{mirror_prefix}What stands out about working with {name}?"
     elif mode == "followup" and topic_id:
         label = TOPIC_METADATA[topic_id]['label']
-        q = f"Could you give one quick example that shows {name}'s {label.lower()} in action?"
+        q = f"{mirror_prefix}What's one moment that really shows {name}'s {label.lower()} in action?"
     else:
-        q = f"Anything important about {name} we haven’t covered?"
+        q = f"{mirror_prefix}Before we wrap, is there anything about working with {name} that you'd want the review team to know?"
+    # new clear directive to force question-only output
     messages = base + [
         {"role": "user", "content": f"Generate only the next question to ask the participant: {q}"}
     ]
     r = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=120)
     return r.choices[0].message.content.strip()
+
+
+def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
+    if st.session_state.finalized:
+        return
+
+    rejection_topic = detect_topic_rejection(user_text)
+    if rejection_topic and rejection_topic not in st.session_state.covered_topics:
+        st.session_state.rejected_topics.add(rejection_topic)
+        st.session_state.covered_topics.add(rejection_topic)
+        st.session_state.topic_notes[rejection_topic].append({
+            "notes": ["Participant declined to discuss this topic."],
+            "verbatim": user_text,
+        })
+        st.session_state.pending_ack_topic = rejection_topic
+
+    notes = analyze_user_response(client, user_text)
+    if notes:
+        record_topic_notes(user_text, notes)
+
+    last_topic = st.session_state.last_topic
+
+    for topic_id in notes:
+        if topic_id != last_topic:
+            mark_topic_covered(topic_id)
+    send_followup = False
+
+    if last_topic:
+        if last_topic in FOLLOWUP_TOPICS and last_topic not in st.session_state.followups_sent:
+            if check_if_vague(client, user_text):
+                send_followup = True
+                st.session_state.followups_sent.add(last_topic)
+            elif detailed_enough(client, TOPIC_METADATA[last_topic]['label'], user_text):
+                mark_topic_covered(last_topic)
+        else:
+            if detailed_enough(client, TOPIC_METADATA[last_topic]['label'], user_text):
+                mark_topic_covered(last_topic)
+
+    if user_wants_to_stop(user_text):
+        st.session_state.no_more_questions = True
+        st.session_state.closing_declined = True
+        append_assistant_message("Understood. We'll stop here.")
+        return
+
+    if st.session_state.last_mode == "closing":
+        st.session_state.no_more_questions = True
+
+    if st.session_state.no_more_questions:
+        return
+
+    if st.session_state.pending_ack_topic:
+        topic_id = st.session_state.pending_ack_topic
+        label = TOPIC_METADATA[topic_id]["label"]
+        append_assistant_message(f"Got it, we'll skip {label.lower()}.")
+        st.session_state.pending_ack_topic = None
+
+    if send_followup and last_topic:
+        question = generate_question(client, persona, mode="followup", topic_id=last_topic)
+        append_assistant_message(question)
+        st.session_state.last_mode = "followup"
+        return
+
+    next_topic = pick_initial_or_next_topic()
+    if next_topic:
+        question = generate_question(client, persona, mode="topic", topic_id=next_topic)
+        append_assistant_message(question)
+        st.session_state.last_topic = next_topic
+        st.session_state.last_mode = "topic"
+        st.session_state.topic_depth[next_topic] += 1
+        return
+
+    if st.session_state.closing_declined:
+        st.session_state.no_more_questions = True
+        return
+
+    question = generate_question(client, persona, mode="closing")
+    append_assistant_message(question)
+    st.session_state.last_mode = "closing"
+    st.session_state.last_topic = None
 
 # ---------- ANALYSIS ----------
 def analyze_user_response(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
@@ -213,6 +433,13 @@ def build_transcript_txt() -> bytes:
     lines = [f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages]
     return ("\n".join(lines)).encode("utf-8")
 
+# ---------- FLOW HELPERS ----------
+def pick_initial_or_next_topic() -> Optional[str]:
+    return next_uncovered_topic()
+
+def mark_topic_covered(topic_id: str) -> None:
+    st.session_state.covered_topics.add(topic_id)
+
 # ---------- MAIN ----------
 def main():
     client = require_api_key()
@@ -226,21 +453,14 @@ def main():
         st.info("Enter the employee's name to begin.")
         st.stop()
 
-    # --- Only run once per new session/persona/employee ---
-    if "started" not in st.session_state or not st.session_state.started \
-       or st.session_state.persona != persona \
-       or st.session_state.get("employee_name") != employee_name:
-
+    if ("persona" not in st.session_state
+        or st.session_state.persona != persona
+        or st.session_state.get("employee_name") != employee_name):
         initialize_session(persona, employee_name)
-
-        if persona == "Self":
-            opening_q = "Tell me about your strengths at work."
-        else:
-            opening_q = f"Tell me about {employee_name}'s strengths."
-
-        st.session_state.messages.append({"role": "assistant", "content": opening_q})
-        st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
-        st.session_state.started = True
+        opening_q = generate_question(client, persona, mode="opening")
+        append_assistant_message(opening_q)
+        st.session_state.last_mode = "opening"
+        st.session_state.last_topic = None
 
     with st.sidebar:
         st.header("Topic Coverage")
@@ -259,6 +479,7 @@ def main():
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
             st.session_state.llm_history.append({"role": "user", "content": user_text})
+            handle_user_response(client, persona, user_text)
             st.rerun()
 
         if len(st.session_state.messages) > 3:
