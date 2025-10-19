@@ -132,7 +132,7 @@ def single_llm_decision(client: OpenAI, persona: str, user_text: str | None) -> 
     user_block = user_text or "No prior response yet."
 
     resp = client.chat.completions.create(
-        model="gpt-5-mini",
+        model="gpt-4-mini",
         messages=[
             {"role": "system", "content": system},
             *conversation_history(),
@@ -159,7 +159,7 @@ def generate_summary(client: OpenAI, persona: str) -> str:
         )
 
     resp = client.chat.completions.create(
-        model="gpt-5-nmini",
+        model="gpt-4-nmini",
         messages=[
             {"role": "system", "content": "Create concise, professional summaries by topic."},
             {
