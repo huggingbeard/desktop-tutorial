@@ -7,6 +7,7 @@ from __future__ import annotations
 # - One concise follow-up for technical/team if vague
 # - Avoids repeating earlier questions; moves on once a topic is done
 
+import asyncio
 import csv
 import io
 import json
@@ -149,7 +150,7 @@ def build_mirror_prefix() -> str:
     fragment = extract_mirror_fragment()
     if not fragment:
         return ""
-    return f'You mentioned "{fragment}" earlier. '
+    return "You touched on that earlier. "
 
 
 def record_topic_notes(user_text: str, notes_by_topic: Dict[str, List[str]]) -> None:
@@ -293,6 +294,8 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.no_more_questions = False
     st.session_state.closing_declined = False
     st.session_state.topic_last_response: Dict[str, str] = {}
+    st.session_state.pending_inputs: List[str] = []
+    st.session_state.processing_stage: str = "idle"
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -326,6 +329,11 @@ def check_if_vague(client: OpenAI, user_text: str) -> bool:
     except Exception:
         return False
 
+
+async def check_if_vague_async(client: OpenAI, user_text: str) -> bool:
+    return await asyncio.to_thread(check_if_vague, client, user_text)
+
+
 def detailed_enough(client: OpenAI, topic_label: str, last_user_texts: str) -> bool:
     prompt = (
         "Given the text, decide if the topic has been explored with concrete examples and enough detail.\n"
@@ -343,6 +351,10 @@ def detailed_enough(client: OpenAI, topic_label: str, last_user_texts: str) -> b
         return bool(res.get("enough", False))
     except Exception:
         return False
+
+
+async def detailed_enough_async(client: OpenAI, topic_label: str, last_user_texts: str) -> bool:
+    return await asyncio.to_thread(detailed_enough, client, topic_label, last_user_texts)
 
 # ---------- FIXED FUNCTION ----------
 def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optional[str] = None) -> str:
@@ -372,6 +384,30 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
     return q.strip()
 
 
+def gather_topic_judgments(
+    client: OpenAI,
+    topic_label: str,
+    user_text: str,
+    need_vague_check: bool,
+    need_detail_check: bool,
+) -> Dict[str, bool]:
+    if not (need_vague_check or need_detail_check):
+        return {}
+
+    async def _runner() -> Dict[str, bool]:
+        tasks = {}
+        if need_vague_check:
+            tasks["vague"] = asyncio.create_task(check_if_vague_async(client, user_text))
+        if need_detail_check:
+            tasks["detail"] = asyncio.create_task(detailed_enough_async(client, topic_label, user_text))
+        results: Dict[str, bool] = {}
+        for key, task in tasks.items():
+            results[key] = await task
+        return results
+
+    return asyncio.run(_runner())
+
+
 def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
     if st.session_state.finalized:
         return
@@ -387,7 +423,7 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
         st.session_state.pending_ack_topic = rejection_topic
         update_topic_brief(rejection_topic)
 
-    notes = analyze_user_response(client, user_text)
+    notes = asyncio.run(analyze_user_response_async(client, user_text))
     if notes:
         record_topic_notes(user_text, notes)
 
@@ -412,15 +448,19 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
             move_on = True
         topic_label = TOPIC_METADATA[last_topic]['label']
         if not move_on:
-            if last_topic in FOLLOWUP_TOPICS and last_topic not in st.session_state.followups_sent:
-                if check_if_vague(client, user_text):
-                    send_followup = True
-                    st.session_state.followups_sent.add(last_topic)
-                elif detailed_enough(client, topic_label, user_text):
-                    move_on = True
-            else:
-                if detailed_enough(client, topic_label, user_text):
-                    move_on = True
+            need_vague = last_topic in FOLLOWUP_TOPICS and last_topic not in st.session_state.followups_sent
+            judgments = gather_topic_judgments(
+                client,
+                topic_label,
+                user_text,
+                need_vague_check=need_vague,
+                need_detail_check=True,
+            )
+            if need_vague and judgments.get("vague"):
+                send_followup = True
+                st.session_state.followups_sent.add(last_topic)
+            elif judgments.get("detail"):
+                move_on = True
         if move_on:
             mark_topic_covered(last_topic)
 
@@ -504,6 +544,10 @@ def analyze_user_response(client: OpenAI, user_text: str) -> Dict[str, List[str]
             out[tid] = [n.strip() for n in t.get("notes", []) if n.strip()]
     return out
 
+
+async def analyze_user_response_async(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
+    return await asyncio.to_thread(analyze_user_response, client, user_text)
+
 # ---------- SUMMARY ----------
 def generate_summary(client: OpenAI, persona: str) -> str:
     name = st.session_state.employee_name
@@ -554,6 +598,21 @@ def pick_initial_or_next_topic() -> Optional[str]:
 def mark_topic_covered(topic_id: str) -> None:
     st.session_state.covered_topics.add(topic_id)
 
+
+def process_pending_inputs_if_ready(client: OpenAI, persona: str) -> tuple[bool, str]:
+    stage = st.session_state.get("processing_stage", "idle")
+    if stage == "display":
+        st.session_state.processing_stage = "process"
+        return False, stage
+    if stage == "process" and st.session_state.pending_inputs:
+        queue = list(st.session_state.pending_inputs)
+        st.session_state.pending_inputs.clear()
+        for pending_text in queue:
+            handle_user_response(client, persona, pending_text)
+        st.session_state.processing_stage = "idle"
+        return True, stage
+    return False, stage
+
 # ---------- MAIN ----------
 def main():
     client = require_api_key()
@@ -593,8 +652,9 @@ def main():
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
             st.session_state.llm_history.append({"role": "user", "content": user_text})
-            handle_user_response(client, persona, user_text)
-            st.rerun()
+            st.session_state.pending_inputs.append(user_text)
+            st.session_state.processing_stage = "display"
+            st.experimental_rerun()
 
         if len(st.session_state.messages) > 3:
             txt_bytes = build_transcript_txt()
@@ -619,6 +679,12 @@ def main():
         st.markdown(st.session_state.summary or "")
         st.download_button("Download topic notes CSV", st.session_state.csv_bytes, "interview_notes.csv", mime="text/csv")
         st.download_button("Download transcript (.txt)", st.session_state.txt_bytes, "interview_transcript.txt", mime="text/plain")
+
+    processed, previous_stage = process_pending_inputs_if_ready(client, persona)
+    if processed:
+        st.experimental_rerun()
+    elif previous_stage == "display" and st.session_state.pending_inputs:
+        st.experimental_rerun()
 
 if __name__ == "__main__":
     main()
