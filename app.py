@@ -107,6 +107,11 @@ SKIP_PATTERNS = {
     "already told you",
     "as i said",
     "same as before",
+    "just said",
+    "already said",
+    "i already told you",
+    "i already said",
+    "told you already",
 }
 
 MAX_TOPIC_ATTEMPTS = 3
@@ -167,7 +172,17 @@ def detect_topic_rejection(user_text: str) -> Optional[str]:
 
 def user_wants_to_stop(user_text: str) -> bool:
     lowered = user_text.strip().lower()
-    return lowered in {"no we are done", "no we're done", "we're done", "we are done"}
+    return lowered in {
+        "no we are done",
+        "no we're done",
+        "we're done",
+        "we are done",
+        "finish",
+        "all done",
+        "done",
+        "that's all",
+        "that is all",
+    }
 
 
 def user_requests_next(user_text: str) -> bool:
@@ -431,7 +446,9 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
 
     if st.session_state.last_mode == "closing":
         st.session_state.no_more_questions = True
-
+        append_assistant_message("Appreciate it — that's everything I needed. Thanks for walking me through this.")
+        st.session_state.last_mode = None
+        
     if st.session_state.no_more_questions:
         return
 
@@ -578,13 +595,6 @@ def main():
         for t, m in TOPIC_METADATA.items():
             st.checkbox(m["label"], value=t in st.session_state.covered_topics, disabled=True)
         st.caption(coverage_status())
-        st.subheader("Running notes")
-        for t in TOPIC_ORDER:
-            briefs = st.session_state.topic_briefs.get(t, set())
-            if briefs:
-                label = TOPIC_METADATA[t]["label"]
-                snippets = sorted(list(briefs))[:3]
-                st.markdown(f"**{label}:** {'; '.join(snippets)}")
 
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
