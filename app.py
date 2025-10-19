@@ -1,6 +1,6 @@
 from __future__ import annotations
 """Interactive Streamlit app for an LLM-guided interview assistant.
-stricter leadership tagging + transcript + employee name + early transcript download"""
+fixes: stops repeating topics, respects 'we covered that', adds transcript & name"""
 
 import csv
 import io
@@ -56,9 +56,6 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.summary = None
     st.session_state.csv_bytes = None
     st.session_state.txt_bytes = None
-    st.session_state.just_asked_followup = False
-    st.session_state.followup_count = 0
-    st.session_state.awaiting_assistant_response = False
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -96,15 +93,15 @@ def generate_assistant_message(client: OpenAI, persona: str) -> str:
         pronoun_instruction
         + "\n\n"
         + "Guide the discussion with warm, professional language, asking one question at a time. "
-        "Encourage rich reflections while ensuring the interview covers leadership, technical competence, "
-        "and team orientation. If a topic is marked as covered, do NOT ask about it again. "
-        "When asking for examples, reference what they already said. "
-        "No GPT-speak-- no 'delve' 'reveal' 'surface' etc! If all topics are covered, invite final reflections and summarize."
+        "Cover leadership, technical competence, and team orientation, but never obsess over completeness. "
+        "If a topic was clearly discussed or the participant says it's already covered, move on. "
+        "No GPT speak - no delve etc. Avoid repeating or rephrasing previous questions. "
+        "Once all topics are discussed, wrap up politely."
     )
 
     status = f"Participant type: {persona}. Topic status: {coverage_status()}."
     if not conversation_history():
-        status += f" Begin by asking an open question about {name}'s overall strengths."
+        status += f" Begin with an open question about {name}'s overall strengths."
     elif next_uncovered_topic():
         lbl = TOPIC_METADATA[next_uncovered_topic()]['label']
         status += f" The next area to discuss is {lbl}."
@@ -229,11 +226,20 @@ def main():
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
             st.session_state.llm_history.append({"role": "user", "content": user_text})
+
             try:
+                # detect closure signals
+                closure_signals = ("we covered", "already said", "nothing more", "no more", "done")
+                if any(sig in user_text.lower() for sig in closure_signals):
+                    if next_uncovered_topic():
+                        st.session_state.covered_topics.add(next_uncovered_topic())
+
                 notes = analyze_user_response(client, user_text)
+                # mark topics covered BEFORE generating next message
                 for t, vals in notes.items():
                     st.session_state.covered_topics.add(t)
                     st.session_state.topic_notes[t].append({"verbatim": user_text, "notes": vals})
+
                 reply = generate_assistant_message(client, persona)
                 st.session_state.messages.append({"role": "assistant", "content": reply})
                 st.session_state.llm_history.append({"role": "assistant", "content": reply})
