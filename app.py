@@ -1,5 +1,6 @@
 from __future__ import annotations
-"""Interactive Streamlit app for an LLM-guided interview assistant. stricter leadership tagging + transcript + employee name"""
+"""Interactive Streamlit app for an LLM-guided interview assistant.
+stricter leadership tagging + transcript + employee name + early transcript download"""
 
 import csv, io, json, os
 from typing import Dict, List, Sequence
@@ -19,7 +20,6 @@ TOPIC_METADATA = {
     "team_orientation": {"label": "Team Orientation"},
 }
 
-
 # ---------- API KEY ----------
 @st.cache_resource(show_spinner=False)
 def get_openai_client(api_key: str) -> OpenAI:
@@ -35,11 +35,10 @@ def require_api_key() -> OpenAI:
     if not key: st.error("OPENAI_API_KEY missing"); st.stop()
     return get_openai_client(key)
 
-
 # ---------- SESSION ----------
-def initialize_session(persona:str, employee_name:str)->None:   # NEW
+def initialize_session(persona:str, employee_name:str)->None:
     st.session_state.persona=persona
-    st.session_state.employee_name=employee_name.strip() or "the employee"  # NEW
+    st.session_state.employee_name=employee_name.strip() or "the employee"
     st.session_state.messages=[]
     st.session_state.llm_history=[]
     st.session_state.covered_topics=set()
@@ -51,7 +50,6 @@ def initialize_session(persona:str, employee_name:str)->None:   # NEW
     st.session_state.just_asked_followup=False
     st.session_state.followup_count=0
     st.session_state.awaiting_assistant_response=False
-
 
 def conversation_history()->Sequence[Dict[str,str]]:
     return st.session_state.llm_history
@@ -66,10 +64,9 @@ def next_uncovered_topic()->str|None:
     for t in TOPIC_METADATA:
         if t not in st.session_state.covered_topics: return t
 
-
 # ---------- CORE LLM ----------
 def generate_assistant_message(client:OpenAI, persona:str)->str:
-    name=st.session_state.employee_name  # NEW
+    name=st.session_state.employee_name
     persona_desc=PERSONA_OPTIONS.get(persona,persona.lower())
 
     if persona=="Self":
@@ -82,6 +79,7 @@ def generate_assistant_message(client:OpenAI, persona:str)->str:
 
     system_prompt=(pronoun_instruction+"\n\n"
         "Guide the discussion with warm, professional language, asking one question at a time. "
+        "No GPT-speak! No "delve" "reveal" "surface" etc. Avoid all words known for the GPT-ness."
         "Encourage rich reflections while ensuring the interview covers leadership, technical competence, and team orientation. "
         "If a topic is marked as covered, do NOT ask about it again. "
         "When asking for examples, reference what they already said. "
@@ -100,9 +98,7 @@ def generate_assistant_message(client:OpenAI, persona:str)->str:
     r=client.chat.completions.create(model="gpt-4o-mini",messages=msgs)
     return r.choices[0].message.content.strip()
 
-
 def analyze_user_response(client:OpenAI,user_text:str)->Dict[str,List[str]]:
-    """Strict detection; leadership only if explicit."""
     prompt=(
         "Detect which topics are explicitly discussed (leadership, technical_competence, team_orientation).\n"
         "Rules (strict):\n"
@@ -129,7 +125,6 @@ def analyze_user_response(client:OpenAI,user_text:str)->Dict[str,List[str]]:
             out[tid]=[n.strip() for n in t.get("notes",[]) if n.strip()]
     return out
 
-
 def check_if_vague(client:OpenAI,user_text:str)->bool:
     prompt=("Is the response too vague and would benefit from a concrete example? "
             "Return JSON {\"is_vague\": true/false}.")
@@ -139,7 +134,6 @@ def check_if_vague(client:OpenAI,user_text:str)->bool:
             response_format={"type":"json_object"})
         return json.loads(r.choices[0].message.content).get("is_vague",False)
     except Exception: return False
-
 
 def generate_followup_for_example(client:OpenAI,user_text:str,persona:str)->str:
     name=st.session_state.employee_name
@@ -151,12 +145,10 @@ def generate_followup_for_example(client:OpenAI,user_text:str,persona:str)->str:
                   {"role":"user","content":f"They said: {user_text}"}])
     return r.choices[0].message.content.strip()
 
-
 def record_topic_notes(user_text:str,notes:Dict[str,List[str]]):
     for t,vals in notes.items():
         st.session_state.covered_topics.add(t)
         st.session_state.topic_notes[t].append({"verbatim":user_text,"notes":vals})
-
 
 def generate_summary(client:OpenAI,persona:str)->str:
     name=st.session_state.employee_name
@@ -169,7 +161,6 @@ def generate_summary(client:OpenAI,persona:str)->str:
                        "instructions":f"Summarize each topic in 2–3 bullets about {name}. Be factual and concise."})}],
         max_tokens=700)
     return r.choices[0].message.content.strip()
-
 
 def build_topic_csv(persona:str)->bytes:
     buf=io.StringIO(); w=csv.DictWriter(buf,
@@ -189,7 +180,6 @@ def build_transcript_txt()->bytes:
     lines=[f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages]
     return ("\n".join(lines)).encode("utf-8")
 
-
 # ---------- MAIN ----------
 def main():
     client=require_api_key()
@@ -197,7 +187,7 @@ def main():
     st.caption("LLM-guided structured interviews for qualitative evaluations.")
 
     persona=st.selectbox("Choose participant type", list(PERSONA_OPTIONS.keys()))
-    employee_name=st.text_input("Employee name")  # NEW
+    employee_name=st.text_input("Employee name")
 
     if not employee_name:
         st.info("Please enter the employee's name to begin.")
@@ -217,6 +207,8 @@ def main():
     for m in st.session_state.messages:
         with st.chat_message(m["role"]): st.write(m["content"])
 
+    st.divider()
+
     if not st.session_state.finalized:
         user_text=st.chat_input("Type your response here")
         if user_text:
@@ -231,20 +223,31 @@ def main():
             except Exception as e: st.error(str(e))
             st.rerun()
 
-    st.divider()
-    if st.button("Finalize interview and generate summary", disabled=st.session_state.finalized):
-        try:
-            summary=generate_summary(client,persona)
-            csvb=build_topic_csv(persona)
-            txtb=build_transcript_txt()
-            st.session_state.summary=summary
-            st.session_state.csv_bytes=csvb
-            st.session_state.txt_bytes=txtb
-            st.session_state.finalized=True
-            st.rerun()
-        except Exception as e: st.error(f"Finalization failed: {e}")
+        # show transcript download during interview
+        if len(st.session_state.messages) > 3:
+            txt_bytes = build_transcript_txt()
+            st.download_button(
+                "Download transcript (.txt)",
+                data=txt_bytes,
+                file_name="interview_transcript.txt",
+                mime="text/plain",
+                help="Download a plain-text copy of the full conversation so far.",
+            )
 
-    if st.session_state.finalized and st.session_state.summary:
+        st.divider()
+        if st.button("Finalize interview and generate summary"):
+            try:
+                summary=generate_summary(client,persona)
+                csvb=build_topic_csv(persona)
+                txtb=build_transcript_txt()
+                st.session_state.summary=summary
+                st.session_state.csv_bytes=csvb
+                st.session_state.txt_bytes=txtb
+                st.session_state.finalized=True
+                st.rerun()
+            except Exception as e: st.error(f"Finalization failed: {e}")
+
+    else:
         st.subheader("Interview Summary")
         st.markdown(st.session_state.summary)
         st.download_button("Download topic notes CSV", st.session_state.csv_bytes,
