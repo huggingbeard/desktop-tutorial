@@ -221,12 +221,58 @@ def pick_followup_question(topic_id: str) -> str:
 
 def pick_opening_question() -> str:
     name = st.session_state.employee_name
-    return random.choice(OPENING_QUESTION_BANK).format(name=name)
+    opening = random.choice(OPENING_QUESTION_BANK).format(name=name)
+    return f"Thanks for taking the time to share your perspective on {name}. {opening}"
 
 
 def pick_closing_question() -> str:
     name = st.session_state.employee_name
     return random.choice(CLOSING_PROMPTS).format(name=name)
+
+
+# ---------- LLM TRANSITIONS ----------
+def generate_natural_transition(client: OpenAI, user_response: str, next_question: str) -> str:
+    """Generate a natural acknowledgment + transition using the LLM"""
+    prompt = (
+        f"You are conducting a performance review interview. The interviewee just said: \"{user_response}\"\n\n"
+        f"Acknowledge what they said in 1 SHORT sentence (10-15 words max), then ask: \"{next_question}\"\n\n"
+        "Be warm and conversational. Reference something specific they mentioned. "
+        "Format: [brief acknowledgment]. [question]\n"
+        "Example: 'That leadership during the launch really stands out. How does she shape the team dynamic day-to-day?'"
+    )
+    
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100,
+            temperature=0.7,
+        )
+        return r.choices[0].message.content.strip()
+    except Exception:
+        # Fallback to simple transition
+        return f"That's helpful. {next_question}"
+
+
+def generate_simple_acknowledgment(client: OpenAI, user_response: str) -> str:
+    """Generate a brief, natural acknowledgment without a follow-up question"""
+    prompt = (
+        f"You are conducting a performance review interview. The interviewee just said: \"{user_response}\"\n\n"
+        "Acknowledge what they said in ONE brief, warm sentence (8-12 words). "
+        "Reference something specific they mentioned. Don't ask a question.\n"
+        "Examples: 'That collaborative instinct really comes through.', 'The timeline management piece is interesting.'"
+    )
+    
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            temperature=0.7,
+        )
+        return r.choices[0].message.content.strip()
+    except Exception:
+        return "That's really helpful context."
 
 
 # ---------- ANALYSIS ----------
@@ -346,59 +392,74 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
     if current_topic:
         st.session_state.topic_last_response[current_topic] = user_text
 
+    # Handle explicit stop requests
     if user_wants_to_stop(user_text):
         st.session_state.no_more_questions = True
         st.session_state.awaiting_closing_reply = False
-        append_assistant_message("Understood. We'll wrap here. Thanks for the insights.")
+        append_assistant_message("Understood. Thanks so much for sharing all of that - really helpful insights.")
         return
 
+    # Analyze the response
     notes = asyncio.run(analyze_user_response_async(client, user_text))
     if notes:
         record_topic_notes(user_text, notes)
         for topic_id in notes:
             mark_topic_covered(topic_id)
 
+    # If they talked about something off-topic, still capture it
     if current_topic and current_topic not in notes:
         st.session_state.topic_notes.setdefault(current_topic, []).append(
             {"notes": [user_text.strip()], "verbatim": user_text}
         )
 
+    # Handle explicit "move on" requests
     if current_topic and user_requests_next(user_text):
         mark_topic_covered(current_topic)
-        append_assistant_message("No worries, let's shift to something else.")
+        ack = generate_simple_acknowledgment(client, user_text)
+        append_assistant_message(ack)
         st.session_state.last_topic = None
+    # Handle repetitive answers
     elif current_topic and response_is_repeat(current_topic, user_text):
         mark_topic_covered(current_topic)
-        append_assistant_message("Got it, we'll keep moving.")
+        append_assistant_message("Got it, I think we've captured that well.")
         st.session_state.last_topic = None
+    # Consider a follow-up if answer is too brief (but only once per topic)
     elif current_topic and not st.session_state.followups_sent[current_topic] and needs_followup(
         current_topic, user_text
     ):
         followup = pick_followup_question(current_topic)
-        append_assistant_message(followup)
+        transition = generate_natural_transition(client, user_text, followup)
+        append_assistant_message(transition)
         st.session_state.followups_sent[current_topic] = True
         st.session_state.topic_attempts[current_topic] += 1
         return
     else:
+        # Move past current topic
         if current_topic:
             mark_topic_covered(current_topic)
             st.session_state.last_topic = None
 
+    # Move to next topic
     next_topic = next_uncovered_topic()
     if next_topic:
         question = pick_topic_question(next_topic)
-        append_assistant_message(question)
+        transition = generate_natural_transition(client, user_text, question)
+        append_assistant_message(transition)
         st.session_state.last_topic = next_topic
         st.session_state.topic_attempts[next_topic] += 1
         return
 
+    # All topics covered - ask closing question
     if not st.session_state.awaiting_closing_reply:
         closing = pick_closing_question()
-        append_assistant_message(closing)
+        transition = generate_natural_transition(client, user_text, closing)
+        append_assistant_message(transition)
         st.session_state.awaiting_closing_reply = True
         return
 
-    append_assistant_message("Appreciate you sharing all of that. Thanks again.")
+    # Final wrap-up
+    ack = generate_simple_acknowledgment(client, user_text)
+    append_assistant_message(f"{ack} Really appreciate you taking the time.")
     st.session_state.awaiting_closing_reply = False
     st.session_state.no_more_questions = True
 
