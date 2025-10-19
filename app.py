@@ -106,8 +106,7 @@ INSTRUCTIONS:
 - If the user's response is detailed and specific, acknowledge it warmly and decide:
   * If you have good insights on this topic (after 1-2 exchanges), move to the next topic
   * If their response warrants one more clarifying question, ask it
-- Do not invent or hallucinate "context"; in your questions, stick with the facts u really know (like answers received) and little else.
-- When moving to a new topic, clearly signal the transition
+- When moving to a new topic, do it ALL IN ONE MESSAGE: acknowledge current response + introduce new topic + ask opening question
 - Reference specific things they said to show you're listening
 - Never ask more than 1 follow-up question per user response
 
@@ -129,7 +128,12 @@ def generate_llm_response(client: OpenAI, user_text: str) -> tuple[str, bool, st
     # Add decision-making instruction
     current_topic = current_topic_id()
     if current_topic:
-        decision_prompt = f"""After responding, decide if you have enough information about {TOPIC_METADATA[current_topic]['label']} to move on.
+        next_topic_idx = st.session_state.current_topic_index + 1
+        next_topic = TOPIC_SEQUENCE[next_topic_idx] if next_topic_idx < len(TOPIC_SEQUENCE) else None
+        
+        if next_topic:
+            next_topic_info = TOPIC_METADATA[next_topic]
+            decision_prompt = f"""After responding, decide if you have enough information about {TOPIC_METADATA[current_topic]['label']} to move on.
 
 Respond with JSON:
 {{
@@ -138,20 +142,45 @@ Respond with JSON:
     "key_insights": "brief summary of what you learned from this response"
 }}
 
+If move_to_next_topic is TRUE, your response should:
+1. Briefly acknowledge what they just said (1 sentence)
+2. Transition to the next topic: {next_topic_info['label']}
+3. Ask your opening question about {next_topic_info['label']}
+
+ALL IN ONE MESSAGE. Example: "That leadership during the launch really stands out. Now let's talk about collaboration. How does {st.session_state.employee_name} work with the team day-to-day?"
+
 Set move_to_next_topic to true if:
-- You have 1-2 good specific examples or insights on this topic
+- You have 1-2 good specific examples on this topic
 - The user explicitly asks to move on
 - You've had 3+ exchanges on this topic
 
-Set it to false if:
-- This is the first response and it's vague/brief
-- You need one clarifying example"""
+If FALSE, just ask one follow-up question about the current topic: {TOPIC_METADATA[current_topic]['label']}."""
+        else:
+            # Last topic, moving to wrap-up
+            decision_prompt = f"""After responding, decide if you have enough information about {TOPIC_METADATA[current_topic]['label']} to move on.
+
+Respond with JSON:
+{{
+    "response": "your conversational response here",
+    "move_to_next_topic": true/false,
+    "key_insights": "brief summary of what you learned from this response"
+}}
+
+If move_to_next_topic is TRUE, your response should wrap up the interview:
+1. Acknowledge their last point
+2. Ask if there's anything else important to share about {st.session_state.employee_name}
+3. Be warm and appreciative
+
+ALL IN ONE MESSAGE.
+
+Set it to true if you have enough on this topic."""
     else:
-        decision_prompt = """The interview is wrapping up. Respond warmly and thank them.
+        # Already wrapping up
+        decision_prompt = """The interview is complete. Thank them warmly.
 
 Respond with JSON:
 {
-    "response": "your conversational response",
+    "response": "your warm closing message",
     "move_to_next_topic": false,
     "key_insights": "any final thoughts"
 }"""
@@ -161,7 +190,7 @@ Respond with JSON:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                *history[:-1],  # All history except last user message
+                *history[:-1],
                 {"role": "user", "content": f"{user_text}\n\n{decision_prompt}"}
             ],
             response_format={"type": "json_object"},
@@ -176,7 +205,6 @@ Respond with JSON:
         return response, should_move, insights
         
     except Exception as e:
-        # Fallback
         return "Thanks for sharing that. What else can you tell me?", False, user_text
 
 
@@ -286,20 +314,16 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
         })
         st.session_state.responses_this_topic += 1
     
-    # Send assistant response
+    # Send assistant response (includes topic transition if should_move=True)
     append_assistant_message(assistant_response)
     
-    # Handle topic transition
+    # Update topic tracking
     if should_move:
         st.session_state.current_topic_index += 1
         st.session_state.responses_this_topic = 0
         
-        # Start next topic or wrap up
-        new_topic_intro = start_new_topic(client)
-        if new_topic_intro:
-            append_assistant_message(new_topic_intro)
-        else:
-            # Interview complete
+        # Check if interview is complete
+        if st.session_state.current_topic_index >= len(TOPIC_SEQUENCE):
             st.session_state.interview_complete = True
 
 
