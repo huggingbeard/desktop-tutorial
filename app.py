@@ -254,7 +254,7 @@ def main():
 
     st.divider()
 
-    if not st.session_state.finalized:
+if not st.session_state.finalized:
         user_text = st.chat_input("Type your response here")
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
@@ -263,45 +263,60 @@ def main():
             try:
                 text_lower = user_text.lower()
 
-                # 1. detect N/A signals
+                # 1) N/A detection (mark topic as covered when explicitly rejected)
                 na_signals = {
-                    "leadership": ("not in a leadership", "doesn't lead", "not a leader", "no leadership"),
-                    "technical_competence": ("no technical", "not technical", "doesn't code"),
-                    "team_orientation": ("not a team player", "doesn't work with others"),
+                    "leadership": (
+                        "not in a leadership", "not a leader", "doesn't lead",
+                        "doesnt lead", "no leadership", "not his job", "not her job"
+                    ),
+                    "technical_competence": ("no technical", "not technical", "doesn't code", "doesnt code"),
+                    "team_orientation": ("not a team player", "doesn't work with others", "doesnt work with others"),
                 }
                 for topic_id, signals in na_signals.items():
                     if any(sig in text_lower for sig in signals):
                         st.session_state.covered_topics.add(topic_id)
 
-                # 2. analyze topics
+                # 2) Analyze topics mentioned
                 notes = analyze_user_response(client, user_text)
-                for t, vals in notes.items():
-                    st.session_state.covered_topics.add(t)
-                    st.session_state.topic_notes[t].append({"verbatim": user_text, "notes": vals})
 
-                # 3. decide next step
-                # If we just had a vague reply about technical/team topics, follow up once
-                followup_needed = False
-                followup_text = ""
+                # 3) Decide on follow-up BEFORE marking covered
+                reply = None
+                # Prioritize follow-up for technical competence and team orientation
                 for topic_id in ["technical_competence", "team_orientation"]:
                     if topic_id in notes and topic_id not in st.session_state.covered_topics:
                         if check_if_vague(client, user_text):
-                            followup_needed = True
-                            followup_text = generate_followup_for_example(
+                            # Ask for one concrete example; do NOT mark covered yet
+                            reply = generate_followup_for_example(
                                 client, user_text, TOPIC_METADATA[topic_id]["label"], persona
                             )
-                            st.session_state.covered_topics.add(topic_id)
-                            break
+                            # Still record the note, but leave topic open until the follow-up answer arrives
+                            st.session_state.topic_notes[topic_id].append(
+                                {"verbatim": user_text, "notes": notes[topic_id]}
+                            )
+                            break  # only one follow-up per turn
 
-                if followup_needed and followup_text:
-                    reply = followup_text
-                else:
+                # 4) If no follow-up needed, record notes and mark covered now (conservative)
+                if reply is None:
+                    for t, vals in notes.items():
+                        st.session_state.topic_notes[t].append({"verbatim": user_text, "notes": vals})
+                        # Only mark covered if not previously marked N/A and response wasn't vague for depth-required topics
+                        if t in ["technical_competence", "team_orientation"]:
+                            if not check_if_vague(client, user_text):
+                                st.session_state.covered_topics.add(t)
+                        else:
+                            # leadership gets marked covered only if actually evidenced (or via N/A above)
+                            st.session_state.covered_topics.add(t)
+
+                    # 5) Generate normal next question
                     reply = generate_assistant_message(client, persona)
 
+                # 6) Emit assistant message
                 st.session_state.messages.append({"role": "assistant", "content": reply})
                 st.session_state.llm_history.append({"role": "assistant", "content": reply})
+
             except Exception as e:
                 st.error(str(e))
+
             st.rerun()
 
         # transcript download during interview
