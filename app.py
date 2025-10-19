@@ -1,6 +1,9 @@
 from __future__ import annotations
-"""Interactive Streamlit app for an LLM-guided interview assistant.
-fixes: stops repeating topics, respects 'we covered that', adds transcript & name"""
+"""ZEPHYRON Interview Assistant
+LLM-guided structured interviews with smarter topic handling:
+- Marks topics N/A when respondent rejects relevance
+- Adds one intelligent follow-up for technical competence and teamwork if vague
+"""
 
 import csv
 import io
@@ -12,18 +15,15 @@ from openai import OpenAI
 
 st.set_page_config(page_title="Interview Assistant", page_icon="🗣️")
 
-PERSONA_OPTIONS = {
-    "Boss": "manager",
-    "Colleague": "colleague",
-    "Self": "self-evaluation",
-}
+# ---------- CONFIG ----------
+PERSONA_OPTIONS = {"Boss": "manager", "Colleague": "colleague", "Self": "self-evaluation"}
 TOPIC_METADATA = {
     "leadership": {"label": "Leadership"},
     "technical_competence": {"label": "Technical Competence"},
     "team_orientation": {"label": "Team Orientation"},
 }
 
-# ---------- API KEY ----------
+# ---------- OPENAI ----------
 @st.cache_resource(show_spinner=False)
 def get_openai_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key)
@@ -56,6 +56,7 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.summary = None
     st.session_state.csv_bytes = None
     st.session_state.txt_bytes = None
+    st.session_state.pending_followup = None  # track if a follow-up is queued
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -72,31 +73,63 @@ def next_uncovered_topic() -> str | None:
             return t
     return None
 
+# ---------- LLM UTILITIES ----------
+def check_if_vague(client: OpenAI, user_text: str) -> bool:
+    """Ask model if response is vague."""
+    prompt = (
+        "Determine if the response is vague (generic adjectives, no examples, short, or abstract). "
+        "Return JSON {\"is_vague\": true/false}."
+    )
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_text},
+            ],
+            response_format={"type": "json_object"},
+        )
+        res = json.loads(r.choices[0].message.content)
+        return res.get("is_vague", False)
+    except Exception:
+        return False
+
+def generate_followup_for_example(client: OpenAI, user_text: str, topic_label: str, persona: str) -> str:
+    """Generate a one-line follow-up asking for an example."""
+    name = st.session_state.employee_name
+    prompt = (
+        f"You are interviewing about {name}. The topic is {topic_label}. "
+        "The previous answer was vague. Ask ONE brief, natural follow-up question "
+        "inviting a specific example or detail. Keep it polite and conversational."
+    )
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_text},
+        ],
+    )
+    return r.choices[0].message.content.strip()
+
 # ---------- CORE LLM ----------
 def generate_assistant_message(client: OpenAI, persona: str) -> str:
     name = st.session_state.employee_name
     persona_desc = PERSONA_OPTIONS.get(persona, persona.lower())
-
     if persona == "Self":
-        pronoun_instruction = (
-            f"You are interviewing {name} about their own performance. "
-            "Use second-person pronouns (you/your)."
-        )
+        pronoun_instruction = f"You are interviewing {name} about their own performance. Use 'you/your'."
     else:
         pronoun_instruction = (
             f"You are interviewing the {persona_desc} about {name}. "
-            f"{name} is the employee being discussed. "
-            "Always use their name or 'they/their' when natural, never 'you'."
+            f"Always use {name} or 'they/their' when natural, never 'you'."
         )
 
     system_prompt = (
         pronoun_instruction
         + "\n\n"
-        + "Guide the discussion with warm, professional language, asking one question at a time. "
-        "Cover leadership, technical competence, and team orientation, but never obsess over completeness. "
-        "If a topic was clearly discussed or the participant says it's already covered, move on. "
-        "No GPT speak - no delve etc. Avoid repeating or rephrasing previous questions. "
-        "Once all topics are discussed, wrap up politely."
+        + "Guide the discussion professionally, one question at a time. "
+        "Only cover topics that are relevant and not already marked as covered. "
+        "If the participant says a topic does not apply (e.g. not a leader), mark it covered as N/A and skip it. "
+        "If all topics are covered, wrap up. Avoid repetition or paraphrasing of old questions."
     )
 
     status = f"Participant type: {persona}. Topic status: {coverage_status()}."
@@ -106,7 +139,7 @@ def generate_assistant_message(client: OpenAI, persona: str) -> str:
         lbl = TOPIC_METADATA[next_uncovered_topic()]['label']
         status += f" The next area to discuss is {lbl}."
     else:
-        status += f" All topics are covered. Wrap up politely, referring to {name} by name."
+        status += f" All topics are covered. Wrap up politely referring to {name}."
 
     msgs = [{"role": "system", "content": system_prompt}] + list(conversation_history()) + [
         {"role": "system", "content": status}
@@ -115,14 +148,14 @@ def generate_assistant_message(client: OpenAI, persona: str) -> str:
     return r.choices[0].message.content.strip()
 
 def analyze_user_response(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
+    """Detect which topics are covered, conservative matching."""
     prompt = (
-        "Detect which topics are explicitly discussed (leadership, technical_competence, team_orientation).\n"
+        "Detect which of leadership, technical_competence, team_orientation appear explicitly. "
         "Rules (strict):\n"
-        "- leadership: only if managing, leading, inspiring, motivating, delegating, supervising, decision-making are mentioned.\n"
-        "- technical_competence: skills, expertise, problem solving, analysis, output quality, domain knowledge.\n"
-        "- team_orientation: teamwork, helping others, collaboration, communication, morale.\n"
-        "Do NOT infer leadership from being lazy, late, or similar. Be conservative.\n"
-        "Return JSON: {\"topics\":[{\"topic_id\":\"...\",\"notes\":[\"...\"]}]}."
+        "- leadership: mentions managing, leading, inspiring, delegating, decision-making.\n"
+        "- technical_competence: skills, expertise, problem solving, quality of work.\n"
+        "- team_orientation: teamwork, helping others, communication, morale.\n"
+        "Return JSON {\"topics\":[{\"topic_id\":\"...\",\"notes\":[\"...\"]}]}."
     )
     try:
         r = client.chat.completions.create(
@@ -165,10 +198,10 @@ def generate_summary(client: OpenAI, persona: str) -> str:
     )
     return r.choices[0].message.content.strip()
 
+# ---------- EXPORTS ----------
 def build_topic_csv(persona: str) -> bytes:
     buf = io.StringIO()
-    w = csv.DictWriter(buf,
-        fieldnames=["persona", "topic", "note_index", "note_summary", "verbatim_response"])
+    w = csv.DictWriter(buf, fieldnames=["persona", "topic", "note_index", "note_summary", "verbatim_response"])
     w.writeheader()
     for t, m in TOPIC_METADATA.items():
         entries = st.session_state.topic_notes.get(t, [])
@@ -228,19 +261,43 @@ def main():
             st.session_state.llm_history.append({"role": "user", "content": user_text})
 
             try:
-                # detect closure signals
-                closure_signals = ("we covered", "already said", "nothing more", "no more", "done")
-                if any(sig in user_text.lower() for sig in closure_signals):
-                    if next_uncovered_topic():
-                        st.session_state.covered_topics.add(next_uncovered_topic())
+                text_lower = user_text.lower()
 
+                # 1. detect N/A signals
+                na_signals = {
+                    "leadership": ("not in a leadership", "doesn't lead", "not a leader", "no leadership"),
+                    "technical_competence": ("no technical", "not technical", "doesn't code"),
+                    "team_orientation": ("not a team player", "doesn't work with others"),
+                }
+                for topic_id, signals in na_signals.items():
+                    if any(sig in text_lower for sig in signals):
+                        st.session_state.covered_topics.add(topic_id)
+
+                # 2. analyze topics
                 notes = analyze_user_response(client, user_text)
-                # mark topics covered BEFORE generating next message
                 for t, vals in notes.items():
                     st.session_state.covered_topics.add(t)
                     st.session_state.topic_notes[t].append({"verbatim": user_text, "notes": vals})
 
-                reply = generate_assistant_message(client, persona)
+                # 3. decide next step
+                # If we just had a vague reply about technical/team topics, follow up once
+                followup_needed = False
+                followup_text = ""
+                for topic_id in ["technical_competence", "team_orientation"]:
+                    if topic_id in notes and topic_id not in st.session_state.covered_topics:
+                        if check_if_vague(client, user_text):
+                            followup_needed = True
+                            followup_text = generate_followup_for_example(
+                                client, user_text, TOPIC_METADATA[topic_id]["label"], persona
+                            )
+                            st.session_state.covered_topics.add(topic_id)
+                            break
+
+                if followup_needed and followup_text:
+                    reply = followup_text
+                else:
+                    reply = generate_assistant_message(client, persona)
+
                 st.session_state.messages.append({"role": "assistant", "content": reply})
                 st.session_state.llm_history.append({"role": "assistant", "content": reply})
             except Exception as e:
@@ -255,7 +312,7 @@ def main():
                 data=txt_bytes,
                 file_name="interview_transcript.txt",
                 mime="text/plain",
-                help="Download a plain-text copy of the full conversation so far.",
+                help="Download plain-text conversation.",
             )
 
         st.divider()
@@ -275,14 +332,16 @@ def main():
     else:
         st.subheader("Interview Summary")
         st.markdown(st.session_state.summary)
-        st.download_button("Download topic notes CSV",
-                           st.session_state.csv_bytes,
-                           file_name="interview_notes.csv",
-                           mime="text/csv")
-        st.download_button("Download transcript (.txt)",
-                           st.session_state.txt_bytes,
-                           file_name="interview_transcript.txt",
-                           mime="text/plain")
+        st.download_button(
+            "Download topic notes CSV",
+            st.session_state.csv_bytes,
+            file_name="interview_notes.csv",
+            mime="text/csv")
+        st.download_button(
+            "Download transcript (.txt)",
+            st.session_state.txt_bytes,
+            file_name="interview_transcript.txt",
+            mime="text/plain")
 
 if __name__ == "__main__":
     main()
