@@ -1,8 +1,9 @@
 from __future__ import annotations
 """ZEPHYRON Interview Assistant
 Natural tone + learning flow:
+- Hard-wired first question ("Tell me about your/X's strengths")
 - Tracks topic depth (default 2, up to 3 if not detailed with examples)
-- Marks topics N/A on explicit rejection (e.g., 'not a leader')
+- Marks topics N/A when irrelevant ("not a leader")
 - One concise follow-up for technical/team if vague
 - Avoids repeating earlier questions; moves on once a topic is done
 """
@@ -62,6 +63,7 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.txt_bytes: Optional[bytes] = None
     st.session_state.last_topic: Optional[str] = None
     st.session_state.topic_depth: Dict[str, int] = {t: 0 for t in TOPIC_METADATA}
+    st.session_state.started = False
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -113,7 +115,7 @@ def detailed_enough(client: OpenAI, topic_label: str, last_user_texts: str) -> b
     except Exception:
         return False
 
-# ---------- FIXED FUNCTION ----------
+# ---------- QUESTION GENERATOR ----------
 def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optional[str] = None) -> str:
     """Always generate a QUESTION, never a statement."""
     name = st.session_state.employee_name
@@ -128,9 +130,7 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
         )},
         {"role": "system", "content": f"Participant: {persona_desc}. Employee: {name}."},
     ]
-    if mode == "opening":
-        q = f"What are {name}'s main strengths at work?"
-    elif mode == "topic" and topic_id:
+    if mode == "topic" and topic_id:
         if topic_id == "leadership":
             q = f"How does {name} handle leadership or influence on the team?"
         elif topic_id == "technical_competence":
@@ -142,7 +142,6 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
         q = f"Could you give one quick example that shows {name}'s {label.lower()} in action?"
     else:
         q = f"Anything important about {name} we haven’t covered?"
-    # new clear directive to force question-only output
     messages = base + [
         {"role": "user", "content": f"Generate only the next question to ask the participant: {q}"}
     ]
@@ -214,13 +213,6 @@ def build_transcript_txt() -> bytes:
     lines = [f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages]
     return ("\n".join(lines)).encode("utf-8")
 
-# ---------- FLOW HELPERS ----------
-def pick_initial_or_next_topic() -> Optional[str]:
-    return next_uncovered_topic()
-
-def mark_topic_covered(topic_id: str) -> None:
-    st.session_state.covered_topics.add(topic_id)
-
 # ---------- MAIN ----------
 def main():
     client = require_api_key()
@@ -234,12 +226,13 @@ def main():
         st.info("Enter the employee's name to begin.")
         st.stop()
 
-    if ("persona" not in st.session_state
-        or st.session_state.persona != persona
-        or st.session_state.get("employee_name") != employee_name):
+    # --- Only run once per new session/persona/employee ---
+    if "started" not in st.session_state or not st.session_state.started \
+       or st.session_state.persona != persona \
+       or st.session_state.get("employee_name") != employee_name:
+
         initialize_session(persona, employee_name)
 
-    # Hard-wired, human-sounding opening question
         if persona == "Self":
             opening_q = "Tell me about your strengths at work."
         else:
@@ -247,9 +240,7 @@ def main():
 
         st.session_state.messages.append({"role": "assistant", "content": opening_q})
         st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
-
-        st.session_state.messages.append({"role": "assistant", "content": opening_q})
-        st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
+        st.session_state.started = True
 
     with st.sidebar:
         st.header("Topic Coverage")
@@ -268,7 +259,6 @@ def main():
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
             st.session_state.llm_history.append({"role": "user", "content": user_text})
-            # (rest of logic unchanged from your last working version)
             st.rerun()
 
         if len(st.session_state.messages) > 3:
