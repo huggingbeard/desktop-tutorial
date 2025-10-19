@@ -1,11 +1,11 @@
 from __future__ import annotations
-"""ZEPHYRON Interview Assistant
-Natural tone + learning flow:
-- Tracks topic depth (default 2, up to 3 if not detailed with examples)
-- Marks topics N/A on explicit rejection (e.g., 'not a leader')
-- One concise follow-up for technical/team if vague
-- Avoids repeating earlier questions; moves on once a topic is done
-"""
+
+# ZEPHYRON Interview Assistant
+# Natural tone + learning flow:
+# - Tracks topic depth (default 2, up to 3 if not detailed with examples)
+# - Marks topics N/A on explicit rejection (e.g., "not a leader")
+# - One concise follow-up for technical/team if vague
+# - Avoids repeating earlier questions; moves on once a topic is done
 
 import csv
 import io
