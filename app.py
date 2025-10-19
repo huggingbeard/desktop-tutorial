@@ -238,7 +238,16 @@ def main():
         or st.session_state.persona != persona
         or st.session_state.get("employee_name") != employee_name):
         initialize_session(persona, employee_name)
-        opening_q = generate_question(client, persona, mode="opening")
+
+    # Hard-wired, human-sounding opening question
+        if persona == "Self":
+            opening_q = "Tell me about your strengths at work."
+        else:
+            opening_q = f"Tell me about {employee_name}'s strengths."
+
+        st.session_state.messages.append({"role": "assistant", "content": opening_q})
+        st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
+
         st.session_state.messages.append({"role": "assistant", "content": opening_q})
         st.session_state.llm_history.append({"role": "assistant", "content": opening_q})
 
