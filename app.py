@@ -1,11 +1,11 @@
 from __future__ import annotations
-"""ZEPHYRON Interview Assistant
-Natural tone + learning flow:
-- Tracks topic depth (default 2, up to 3 if not detailed with examples)
-- Marks topics N/A on explicit rejection (e.g., 'not a leader')
-- One concise follow-up for technical/team if vague
-- Avoids repeating earlier questions; moves on once a topic is done
-"""
+
+# ZEPHYRON Interview Assistant
+# Natural tone + learning flow:
+# - Tracks topic depth (default 2, up to 3 if not detailed with examples)
+# - Marks topics N/A on explicit rejection (e.g., "not a leader")
+# - One concise follow-up for technical/team if vague
+# - Avoids repeating earlier questions; moves on once a topic is done
 
 import csv
 import io
@@ -28,6 +28,12 @@ TOPIC_METADATA = {
     "team_orientation": {"label": "Team Orientation"},
 }
 TOPIC_ORDER = ["leadership", "technical_competence", "team_orientation"]
+
+OPENING_QUESTION_BANK = [
+    "When you think about working with {name} lately, what's been standing out?",
+    "What's been the most memorable part of working with {name} recently?",
+    "What have you noticed most about teaming up with {name} these days?",
+]
 
 TOPIC_QUESTION_BANK = {
     "leadership": [
@@ -107,6 +113,11 @@ SKIP_PATTERNS = {
     "already told you",
     "as i said",
     "same as before",
+    "just said",
+    "already said",
+    "i already told you",
+    "i already said",
+    "told you already",
 }
 
 MAX_TOPIC_ATTEMPTS = 3
@@ -167,7 +178,17 @@ def detect_topic_rejection(user_text: str) -> Optional[str]:
 
 def user_wants_to_stop(user_text: str) -> bool:
     lowered = user_text.strip().lower()
-    return lowered in {"no we are done", "no we're done", "we're done", "we are done"}
+    return lowered in {
+        "no we are done",
+        "no we're done",
+        "we're done",
+        "we are done",
+        "finish",
+        "all done",
+        "done",
+        "that's all",
+        "that is all",
+    }
 
 
 def user_requests_next(user_text: str) -> bool:
@@ -327,29 +348,14 @@ def detailed_enough(client: OpenAI, topic_label: str, last_user_texts: str) -> b
 def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optional[str] = None) -> str:
     """Always generate a QUESTION, never a statement."""
     name = st.session_state.employee_name
-    persona_desc = PERSONA_OPTIONS.get(persona, persona.lower())
     mirror_prefix = build_mirror_prefix()
-    progress_brief = build_progress_brief()
     attempts = 0
     if topic_id:
         attempts = st.session_state.topic_depth.get(topic_id, 0)
-    base = [
-        {"role": "system", "content": (
-            "You are conducting a structured performance interview. "
-            "Your job is to ask ONE short, natural, conversational question. "
-            "Never make statements, never summarize, never say what the employee is like — only ask questions. "
-            "Speak like a colleague, not HR. Avoid phrases like 'can you share' or 'could you elaborate'. "
-            "Use direct, plain English."
-        )},
-        {"role": "system", "content": f"Participant: {persona_desc}. Employee: {name}."},
-        {"role": "system", "content": (
-            "Progress so far: " + progress_brief +
-            ". Keep it human, acknowledge when a topic seems covered, and do not repeat the same ask."
-        )},
-    ]
     if mode == "opening":
-        q = f"What are {name}'s main strengths at work?"
-    elif mode == "topic" and topic_id:
+        template = random.choice(OPENING_QUESTION_BANK)
+        return template.format(name=name)
+    if mode == "topic" and topic_id:
         templates = TOPIC_QUESTION_BANK.get(topic_id, [])
         if templates:
             template = random.choice(templates)
@@ -363,12 +369,7 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
         q = f"{mirror_prefix}Before we wrap, is there anything about working with {name} that you'd want the review team to know?"
     if attempts >= MAX_TOPIC_ATTEMPTS - 1 and mode == "topic" and topic_id:
         q = f"{mirror_prefix}Is there anything else worth noting about {name}'s {TOPIC_METADATA[topic_id]['label'].lower()}, or should we move on?"
-    # new clear directive to force question-only output
-    messages = base + [
-        {"role": "user", "content": f"Generate only the next question to ask the participant: {q}"}
-    ]
-    r = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=120)
-    return r.choices[0].message.content.strip()
+    return q.strip()
 
 
 def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
@@ -431,7 +432,9 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
 
     if st.session_state.last_mode == "closing":
         st.session_state.no_more_questions = True
-
+        append_assistant_message("Appreciate it — that's everything I needed. Thanks for walking me through this.")
+        st.session_state.last_mode = None
+        
     if st.session_state.no_more_questions:
         return
 
@@ -578,13 +581,6 @@ def main():
         for t, m in TOPIC_METADATA.items():
             st.checkbox(m["label"], value=t in st.session_state.covered_topics, disabled=True)
         st.caption(coverage_status())
-        st.subheader("Running notes")
-        for t in TOPIC_ORDER:
-            briefs = st.session_state.topic_briefs.get(t, set())
-            if briefs:
-                label = TOPIC_METADATA[t]["label"]
-                snippets = sorted(list(briefs))[:3]
-                st.markdown(f"**{label}:** {'; '.join(snippets)}")
 
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
