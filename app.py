@@ -1,8 +1,8 @@
 from __future__ import annotations
 """ZEPHYRON Interview Assistant
-LLM-guided structured interviews with smarter topic handling:
-- Marks topics N/A when respondent rejects relevance
-- Adds one intelligent follow-up for technical competence and teamwork if vague
+LLM-guided structured interviews with:
+- N/A topic handling (e.g. 'not a leader')
+- One intelligent follow-up for technical competence & teamwork when vague
 """
 
 import csv
@@ -56,7 +56,6 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.summary = None
     st.session_state.csv_bytes = None
     st.session_state.txt_bytes = None
-    st.session_state.pending_followup = None  # track if a follow-up is queued
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -75,7 +74,7 @@ def next_uncovered_topic() -> str | None:
 
 # ---------- LLM UTILITIES ----------
 def check_if_vague(client: OpenAI, user_text: str) -> bool:
-    """Ask model if response is vague."""
+    """Check if a response lacks concrete examples or detail."""
     prompt = (
         "Determine if the response is vague (generic adjectives, no examples, short, or abstract). "
         "Return JSON {\"is_vague\": true/false}."
@@ -95,7 +94,7 @@ def check_if_vague(client: OpenAI, user_text: str) -> bool:
         return False
 
 def generate_followup_for_example(client: OpenAI, user_text: str, topic_label: str, persona: str) -> str:
-    """Generate a one-line follow-up asking for an example."""
+    """Generate a one-line follow-up asking for a concrete example."""
     name = st.session_state.employee_name
     prompt = (
         f"You are interviewing about {name}. The topic is {topic_label}. "
@@ -148,7 +147,7 @@ def generate_assistant_message(client: OpenAI, persona: str) -> str:
     return r.choices[0].message.content.strip()
 
 def analyze_user_response(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
-    """Detect which topics are covered, conservative matching."""
+    """Detect which topics are discussed."""
     prompt = (
         "Detect which of leadership, technical_competence, team_orientation appear explicitly. "
         "Rules (strict):\n"
@@ -198,7 +197,7 @@ def generate_summary(client: OpenAI, persona: str) -> str:
     )
     return r.choices[0].message.content.strip()
 
-# ---------- EXPORTS ----------
+# ---------- EXPORT ----------
 def build_topic_csv(persona: str) -> bytes:
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=["persona", "topic", "note_index", "note_summary", "verbatim_response"])
@@ -254,7 +253,7 @@ def main():
 
     st.divider()
 
-if not st.session_state.finalized:
+    if not st.session_state.finalized:
         user_text = st.chat_input("Type your response here")
         if user_text:
             st.session_state.messages.append({"role": "user", "content": user_text})
@@ -263,7 +262,7 @@ if not st.session_state.finalized:
             try:
                 text_lower = user_text.lower()
 
-                # 1) N/A detection (mark topic as covered when explicitly rejected)
+                # 1) Detect N/A signals
                 na_signals = {
                     "leadership": (
                         "not in a leadership", "not a leader", "doesn't lead",
@@ -276,47 +275,34 @@ if not st.session_state.finalized:
                     if any(sig in text_lower for sig in signals):
                         st.session_state.covered_topics.add(topic_id)
 
-                # 2) Analyze topics mentioned
+                # 2) Analyze response
                 notes = analyze_user_response(client, user_text)
 
-                # 3) Decide on follow-up BEFORE marking covered
+                # 3) Decide on follow-up before marking topics covered
                 reply = None
-                # Prioritize follow-up for technical competence and team orientation
                 for topic_id in ["technical_competence", "team_orientation"]:
-                    if topic_id in notes and topic_id not in st.session_state.covered_topics:
+                    if topic_id in notes:
                         if check_if_vague(client, user_text):
-                            # Ask for one concrete example; do NOT mark covered yet
                             reply = generate_followup_for_example(
                                 client, user_text, TOPIC_METADATA[topic_id]["label"], persona
                             )
-                            # Still record the note, but leave topic open until the follow-up answer arrives
                             st.session_state.topic_notes[topic_id].append(
                                 {"verbatim": user_text, "notes": notes[topic_id]}
                             )
-                            break  # only one follow-up per turn
+                            break
 
-                # 4) If no follow-up needed, record notes and mark covered now (conservative)
+                # 4) If no follow-up, mark covered and move on
                 if reply is None:
                     for t, vals in notes.items():
                         st.session_state.topic_notes[t].append({"verbatim": user_text, "notes": vals})
-                        # Only mark covered if not previously marked N/A and response wasn't vague for depth-required topics
-                        if t in ["technical_competence", "team_orientation"]:
-                            if not check_if_vague(client, user_text):
-                                st.session_state.covered_topics.add(t)
-                        else:
-                            # leadership gets marked covered only if actually evidenced (or via N/A above)
-                            st.session_state.covered_topics.add(t)
-
-                    # 5) Generate normal next question
+                        st.session_state.covered_topics.add(t)
                     reply = generate_assistant_message(client, persona)
 
-                # 6) Emit assistant message
+                # 5) Emit next assistant message
                 st.session_state.messages.append({"role": "assistant", "content": reply})
                 st.session_state.llm_history.append({"role": "assistant", "content": reply})
-
             except Exception as e:
                 st.error(str(e))
-
             st.rerun()
 
         # transcript download during interview
@@ -347,16 +333,14 @@ if not st.session_state.finalized:
     else:
         st.subheader("Interview Summary")
         st.markdown(st.session_state.summary)
-        st.download_button(
-            "Download topic notes CSV",
-            st.session_state.csv_bytes,
-            file_name="interview_notes.csv",
-            mime="text/csv")
-        st.download_button(
-            "Download transcript (.txt)",
-            st.session_state.txt_bytes,
-            file_name="interview_transcript.txt",
-            mime="text/plain")
+        st.download_button("Download topic notes CSV",
+                           st.session_state.csv_bytes,
+                           file_name="interview_notes.csv",
+                           mime="text/csv")
+        st.download_button("Download transcript (.txt)",
+                           st.session_state.txt_bytes,
+                           file_name="interview_transcript.txt",
+                           mime="text/plain")
 
 if __name__ == "__main__":
     main()
