@@ -11,6 +11,8 @@ import csv
 import io
 import json
 import os
+import random
+import re
 from typing import Dict, List, Sequence, Optional
 
 import streamlit as st
@@ -26,6 +28,101 @@ TOPIC_METADATA = {
     "team_orientation": {"label": "Team Orientation"},
 }
 TOPIC_ORDER = ["leadership", "technical_competence", "team_orientation"]
+
+TOPIC_QUESTION_BANK = {
+    "leadership": [
+        "{mirror}When have you seen {name} take the lead or steady the group?",
+        "{mirror}How does {name} rally people when the team needs direction?",
+        "{mirror}What does {name} do when things get messy and someone has to steer?",
+    ],
+    "technical_competence": [
+        "{mirror}Can you walk me through a recent moment where {name}'s technical judgment made the difference?",
+        "{mirror}What recent project shows {name}'s technical chops in action?",
+        "{mirror}When did {name}'s build-or-fix skills really save the day lately?",
+    ],
+    "team_orientation": [
+        "{mirror}What does working with {name} feel like when the team is under pressure?",
+        "{mirror}Who benefits most from {name}'s way of showing up for the team?",
+        "{mirror}What's a recent moment that captures how {name} supports everyone else?",
+    ],
+}
+
+STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "that",
+    "with",
+    "have",
+    "this",
+    "from",
+    "they",
+    "their",
+    "about",
+    "been",
+    "your",
+    "when",
+    "what",
+    "where",
+    "which",
+    "because",
+    "while",
+    "there",
+    "really",
+    "just",
+    "like",
+    "maybe",
+    "very",
+    "were",
+    "also",
+    "into",
+    "those",
+    "these",
+    "through",
+    "still",
+    "even",
+    "could",
+    "should",
+    "would",
+    "does",
+    "don't",
+    "didn't",
+    "can't",
+    "isn't",
+    "wasn't",
+    "aren't",
+    "won't",
+    "hasn't",
+}
+
+
+def extract_mirror_fragment() -> Optional[str]:
+    if "llm_history" not in st.session_state:
+        return None
+    for entry in reversed(st.session_state.llm_history):
+        if entry.get("role") != "user":
+            continue
+        text = entry.get("content", "").strip()
+        if not text:
+            continue
+        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+        for sentence in reversed(sentences):
+            cleaned = sentence.strip()
+            if cleaned:
+                snippet = cleaned[:80]
+                return snippet
+        words = re.findall(r"[A-Za-z0-9'-]+", text)
+        keywords = [w for w in words if len(w) > 3 and w.lower() not in STOPWORDS]
+        if keywords:
+            return " ".join(keywords[:3])[:80]
+    return None
+
+
+def build_mirror_prefix() -> str:
+    fragment = extract_mirror_fragment()
+    if not fragment:
+        return ""
+    return f'You mentioned "{fragment}" earlier. '
 
 # ---------- OPENAI ----------
 @st.cache_resource(show_spinner=False)
@@ -118,6 +215,7 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
     """Always generate a QUESTION, never a statement."""
     name = st.session_state.employee_name
     persona_desc = PERSONA_OPTIONS.get(persona, persona.lower())
+    mirror_prefix = build_mirror_prefix()
     base = [
         {"role": "system", "content": (
             "You are conducting a structured performance interview. "
@@ -131,17 +229,17 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
     if mode == "opening":
         q = f"What are {name}'s main strengths at work?"
     elif mode == "topic" and topic_id:
-        if topic_id == "leadership":
-            q = f"How does {name} handle leadership or influence on the team?"
-        elif topic_id == "technical_competence":
-            q = f"How strong are {name}'s technical skills? Any concrete example?"
+        templates = TOPIC_QUESTION_BANK.get(topic_id, [])
+        if templates:
+            template = random.choice(templates)
+            q = template.format(name=name, mirror=mirror_prefix)
         else:
-            q = f"What is {name} like to work with day to day? Any instance that shows their teamwork?"
+            q = f"{mirror_prefix}What stands out about working with {name}?"
     elif mode == "followup" and topic_id:
         label = TOPIC_METADATA[topic_id]['label']
-        q = f"Could you give one quick example that shows {name}'s {label.lower()} in action?"
+        q = f"{mirror_prefix}What's one moment that really shows {name}'s {label.lower()} in action?"
     else:
-        q = f"Anything important about {name} we haven’t covered?"
+        q = f"{mirror_prefix}Before we wrap, is there anything about working with {name} that you'd want the review team to know?"
     # new clear directive to force question-only output
     messages = base + [
         {"role": "user", "content": f"Generate only the next question to ask the participant: {q}"}
