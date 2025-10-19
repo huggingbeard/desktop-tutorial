@@ -29,6 +29,12 @@ TOPIC_METADATA = {
 }
 TOPIC_ORDER = ["leadership", "technical_competence", "team_orientation"]
 
+OPENING_QUESTION_BANK = [
+    "When you think about working with {name} lately, what's been standing out?",
+    "What's been the most memorable part of working with {name} recently?",
+    "What have you noticed most about teaming up with {name} these days?",
+]
+
 TOPIC_QUESTION_BANK = {
     "leadership": [
         "{mirror}Where have you seen {name} take the lead or steady the group lately?",
@@ -348,6 +354,9 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
     attempts = 0
     if topic_id:
         attempts = st.session_state.topic_depth.get(topic_id, 0)
+    if mode == "opening":
+        template = random.choice(OPENING_QUESTION_BANK)
+        return template.format(name=name)
     base = [
         {"role": "system", "content": (
             "You are conducting a structured performance interview. "
@@ -362,9 +371,7 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
             ". Keep it human, acknowledge when a topic seems covered, and do not repeat the same ask."
         )},
     ]
-    if mode == "opening":
-        q = f"What are {name}'s main strengths at work?"
-    elif mode == "topic" and topic_id:
+    if mode == "topic" and topic_id:
         templates = TOPIC_QUESTION_BANK.get(topic_id, [])
         if templates:
             template = random.choice(templates)
