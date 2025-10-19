@@ -654,7 +654,7 @@ def main():
             st.session_state.llm_history.append({"role": "user", "content": user_text})
             st.session_state.pending_inputs.append(user_text)
             st.session_state.processing_stage = "display"
-            st.experimental_rerun()
+            st.rerun()
 
         if len(st.session_state.messages) > 3:
             txt_bytes = build_transcript_txt()
@@ -682,9 +682,9 @@ def main():
 
     processed, previous_stage = process_pending_inputs_if_ready(client, persona)
     if processed:
-        st.experimental_rerun()
+        st.rerun()
     elif previous_stage == "display" and st.session_state.pending_inputs:
-        st.experimental_rerun()
+        st.rerun()
 
 if __name__ == "__main__":
     main()
