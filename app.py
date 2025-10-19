@@ -13,7 +13,7 @@ import json
 import os
 import random
 import re
-from typing import Dict, List, Sequence, Optional
+from typing import Dict, List, Sequence, Optional, Set
 
 import streamlit as st
 from openai import OpenAI
@@ -98,6 +98,20 @@ STOPWORDS = {
 }
 
 
+SKIP_PATTERNS = {
+    "next",
+    "move on",
+    "skip",
+    "nothing else",
+    "that's it",
+    "already told you",
+    "as i said",
+    "same as before",
+}
+
+MAX_TOPIC_ATTEMPTS = 3
+
+
 def extract_mirror_fragment() -> Optional[str]:
     if "llm_history" not in st.session_state:
         return None
@@ -132,6 +146,7 @@ def record_topic_notes(user_text: str, notes_by_topic: Dict[str, List[str]]) -> 
         st.session_state.topic_notes.setdefault(topic_id, []).append(
             {"notes": notes, "verbatim": user_text}
         )
+        update_topic_brief(topic_id)
 
 
 TOPIC_REJECTION_PATTERNS = {
@@ -153,6 +168,60 @@ def detect_topic_rejection(user_text: str) -> Optional[str]:
 def user_wants_to_stop(user_text: str) -> bool:
     lowered = user_text.strip().lower()
     return lowered in {"no we are done", "no we're done", "we're done", "we are done"}
+
+
+def user_requests_next(user_text: str) -> bool:
+    lowered = re.sub(r"[.!?]+$", "", user_text).strip().lower()
+    return lowered in SKIP_PATTERNS
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def is_repeat_response(topic_id: Optional[str], user_text: str) -> bool:
+    if not topic_id:
+        return False
+    previous = st.session_state.topic_last_response.get(topic_id)
+    if not previous:
+        return False
+    current = normalize_text(user_text)
+    prev_norm = normalize_text(previous)
+    if current == prev_norm:
+        return True
+    if current in {"same", "same thing", "already told you", "as i said"}:
+        return True
+    if len(current) <= 40 and current in prev_norm:
+        return True
+    return False
+
+
+def update_topic_brief(topic_id: str) -> None:
+    entries = st.session_state.topic_notes.get(topic_id, [])
+    snapshots: Set[str] = st.session_state.topic_briefs.setdefault(topic_id, set())
+    if not entries:
+        return
+    latest = entries[-1]
+    for note in latest.get("notes", []):
+        cleaned = note.strip()
+        if cleaned:
+            snapshots.add(cleaned)
+
+
+def build_progress_brief() -> str:
+    segments: List[str] = []
+    for topic_id in TOPIC_ORDER:
+        label = TOPIC_METADATA[topic_id]["label"]
+        if topic_id in st.session_state.topic_briefs and st.session_state.topic_briefs[topic_id]:
+            snippets = list(st.session_state.topic_briefs[topic_id])
+            snippets.sort()
+            summary = "; ".join(snippets[:3])
+            segments.append(f"{label}: {summary}")
+        elif topic_id in st.session_state.covered_topics:
+            segments.append(f"{label}: covered")
+        else:
+            segments.append(f"{label}: pending")
+    return " | ".join(segments)
 
 
 def append_assistant_message(content: str) -> None:
@@ -189,6 +258,7 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.llm_history: List[Dict[str, str]] = []
     st.session_state.covered_topics: set[str] = set()
     st.session_state.topic_notes: Dict[str, List[Dict[str, List[str]]]] = {t: [] for t in TOPIC_METADATA}
+    st.session_state.topic_briefs: Dict[str, Set[str]] = {t: set() for t in TOPIC_METADATA}
     st.session_state.finalized = False
     st.session_state.summary: Optional[str] = None
     st.session_state.csv_bytes: Optional[bytes] = None
@@ -201,6 +271,7 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.followups_sent: set[str] = set()
     st.session_state.no_more_questions = False
     st.session_state.closing_declined = False
+    st.session_state.topic_last_response: Dict[str, str] = {}
 
 def conversation_history() -> Sequence[Dict[str, str]]:
     return st.session_state.llm_history
@@ -258,6 +329,10 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
     name = st.session_state.employee_name
     persona_desc = PERSONA_OPTIONS.get(persona, persona.lower())
     mirror_prefix = build_mirror_prefix()
+    progress_brief = build_progress_brief()
+    attempts = 0
+    if topic_id:
+        attempts = st.session_state.topic_depth.get(topic_id, 0)
     base = [
         {"role": "system", "content": (
             "You are conducting a structured performance interview. "
@@ -267,6 +342,10 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
             "Use direct, plain English."
         )},
         {"role": "system", "content": f"Participant: {persona_desc}. Employee: {name}."},
+        {"role": "system", "content": (
+            "Progress so far: " + progress_brief +
+            ". Keep it human, acknowledge when a topic seems covered, and do not repeat the same ask."
+        )},
     ]
     if mode == "opening":
         q = f"What are {name}'s main strengths at work?"
@@ -282,6 +361,8 @@ def generate_question(client: OpenAI, persona: str, mode: str, topic_id: Optiona
         q = f"{mirror_prefix}What's one moment that really shows {name}'s {label.lower()} in action?"
     else:
         q = f"{mirror_prefix}Before we wrap, is there anything about working with {name} that you'd want the review team to know?"
+    if attempts >= MAX_TOPIC_ATTEMPTS - 1 and mode == "topic" and topic_id:
+        q = f"{mirror_prefix}Is there anything else worth noting about {name}'s {TOPIC_METADATA[topic_id]['label'].lower()}, or should we move on?"
     # new clear directive to force question-only output
     messages = base + [
         {"role": "user", "content": f"Generate only the next question to ask the participant: {q}"}
@@ -303,6 +384,7 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
             "verbatim": user_text,
         })
         st.session_state.pending_ack_topic = rejection_topic
+        update_topic_brief(rejection_topic)
 
     notes = analyze_user_response(client, user_text)
     if notes:
@@ -314,17 +396,32 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
         if topic_id != last_topic:
             mark_topic_covered(topic_id)
     send_followup = False
+    move_on = False
+    requested_next = user_requests_next(user_text)
+    repeated = is_repeat_response(last_topic, user_text)
 
     if last_topic:
-        if last_topic in FOLLOWUP_TOPICS and last_topic not in st.session_state.followups_sent:
-            if check_if_vague(client, user_text):
-                send_followup = True
-                st.session_state.followups_sent.add(last_topic)
-            elif detailed_enough(client, TOPIC_METADATA[last_topic]['label'], user_text):
-                mark_topic_covered(last_topic)
-        else:
-            if detailed_enough(client, TOPIC_METADATA[last_topic]['label'], user_text):
-                mark_topic_covered(last_topic)
+        st.session_state.topic_last_response[last_topic] = user_text
+        attempts = st.session_state.topic_depth.get(last_topic, 0)
+        if attempts >= MAX_TOPIC_ATTEMPTS:
+            move_on = True
+        if requested_next:
+            move_on = True
+        if repeated:
+            move_on = True
+        topic_label = TOPIC_METADATA[last_topic]['label']
+        if not move_on:
+            if last_topic in FOLLOWUP_TOPICS and last_topic not in st.session_state.followups_sent:
+                if check_if_vague(client, user_text):
+                    send_followup = True
+                    st.session_state.followups_sent.add(last_topic)
+                elif detailed_enough(client, topic_label, user_text):
+                    move_on = True
+            else:
+                if detailed_enough(client, topic_label, user_text):
+                    move_on = True
+        if move_on:
+            mark_topic_covered(last_topic)
 
     if user_wants_to_stop(user_text):
         st.session_state.no_more_questions = True
@@ -344,13 +441,27 @@ def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
         append_assistant_message(f"Got it, we'll skip {label.lower()}.")
         st.session_state.pending_ack_topic = None
 
+    if requested_next and last_topic:
+        append_assistant_message("Sure, let's jump to something else.")
+
+    if repeated and last_topic and not requested_next:
+        append_assistant_message("Right, we've already logged that. I'll switch topics.")
+
     if send_followup and last_topic:
         question = generate_question(client, persona, mode="followup", topic_id=last_topic)
         append_assistant_message(question)
         st.session_state.last_mode = "followup"
         return
 
+    if move_on:
+        st.session_state.last_topic = None
+        st.session_state.last_mode = None
+
     next_topic = pick_initial_or_next_topic()
+    while next_topic and st.session_state.topic_depth.get(next_topic, 0) >= MAX_TOPIC_ATTEMPTS:
+        mark_topic_covered(next_topic)
+        next_topic = pick_initial_or_next_topic()
+
     if next_topic:
         question = generate_question(client, persona, mode="topic", topic_id=next_topic)
         append_assistant_message(question)
@@ -467,6 +578,13 @@ def main():
         for t, m in TOPIC_METADATA.items():
             st.checkbox(m["label"], value=t in st.session_state.covered_topics, disabled=True)
         st.caption(coverage_status())
+        st.subheader("Running notes")
+        for t in TOPIC_ORDER:
+            briefs = st.session_state.topic_briefs.get(t, set())
+            if briefs:
+                label = TOPIC_METADATA[t]["label"]
+                snippets = sorted(list(briefs))[:3]
+                st.markdown(f"**{label}:** {'; '.join(snippets)}")
 
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
