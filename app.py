@@ -5,8 +5,6 @@ import csv
 import io
 import json
 import os
-import random
-import re
 from typing import Dict, List, Optional, Sequence
 
 import streamlit as st
@@ -22,93 +20,12 @@ PERSONA_OPTIONS = {
 }
 
 TOPIC_METADATA = {
-    "strengths": {"label": "Strengths"},
-    "collaboration": {"label": "Collaboration"},
-    "growth": {"label": "Growth Areas"},
+    "strengths": {"label": "Strengths", "intro": "First, I'd like to discuss {name}'s strengths."},
+    "collaboration": {"label": "Collaboration", "intro": "Now let's talk about how {name} collaborates with the team."},
+    "growth": {"label": "Growth Areas", "intro": "Finally, let's discuss areas where {name} could grow or develop further."},
 }
 
 TOPIC_SEQUENCE = ["strengths", "collaboration", "growth"]
-
-OPENING_QUESTION_BANK = [
-    "When you look at {name}'s recent work, what strengths jump out first?",
-    "What's the most impressive thing {name} has brought to the table lately?",
-    "Where have you seen {name} really shine in the last stretch?",
-]
-
-TOPIC_QUESTION_BANK = {
-    "strengths": [
-        "Thinking about the last few weeks, where has {name} made the biggest positive impact?",
-        "What do teammates rely on {name} for when things get busy?",
-        "How would you describe {name}'s signature strength right now?",
-    ],
-    "collaboration": [
-        "How does {name} shape the tone or flow of the team when you're working together?",
-        "What have you noticed about the way {name} supports everyone else?",
-        "Can you recall a moment where {name} helped the group stay aligned?",
-    ],
-    "growth": [
-        "Where do you think {name} still has room to grow or get sharper?",
-        "If {name} had a bit more time or coaching, what would you focus it on?",
-        "What habits could {name} adjust to have even more impact?",
-    ],
-}
-
-FOLLOWUP_QUESTION_BANK = {
-    "strengths": [
-        "What's a snapshot or story that captures that strength in action?",
-        "When did you last see {name} lean on that strength in a meaningful way?",
-    ],
-    "collaboration": [
-        "Who benefited most from {name}'s approach in that situation?",
-        "What did {name} actually do to keep the team moving?",
-    ],
-    "growth": [
-        "What makes that area important for {name} right now?",
-        "Have you seen a moment that shows why this is still a stretch for {name}?",
-    ],
-}
-
-CLOSING_PROMPTS = [
-    "Before we wrap, is there anything else about working with {name} that should be on the radar?",
-    "Anything we haven't touched on that the review team should keep in mind about {name}?",
-]
-
-STOP_REQUESTS = {
-    "no we are done",
-    "no we're done",
-    "we are done",
-    "we're done",
-    "finish",
-    "all done",
-    "done",
-    "that's all",
-    "that is all",
-    "stop",
-}
-
-SKIP_PATTERNS = {
-    "next",
-    "move on",
-    "skip",
-    "nothing else",
-    "already told you",
-    "already said",
-    "as i said",
-    "same as before",
-    "just said",
-}
-
-GENERIC_PHRASES = {
-    "not sure",
-    "hard to say",
-    "same",
-    "nothing really",
-    "no idea",
-    "can't think",
-    "i guess",
-    "okay",
-    "fine",
-}
 
 # ---------- OPENAI ----------
 @st.cache_resource(show_spinner=False)
@@ -139,24 +56,16 @@ def initialize_session(persona: str, employee_name: str) -> None:
     st.session_state.employee_name = employee_name.strip() or "the employee"
     st.session_state.messages: List[Dict[str, str]] = []
     st.session_state.llm_history: List[Dict[str, str]] = []
-    st.session_state.covered_topics: set[str] = set()
-    st.session_state.topic_notes: Dict[str, List[Dict[str, List[str]]]] = {t: [] for t in TOPIC_METADATA}
-    st.session_state.followups_sent: Dict[str, bool] = {t: False for t in TOPIC_METADATA}
-    st.session_state.topic_attempts: Dict[str, int] = {t: 0 for t in TOPIC_METADATA}
-    st.session_state.last_topic: Optional[str] = None
-    st.session_state.awaiting_closing_reply = False
+    st.session_state.current_topic_index = 0
+    st.session_state.topic_notes: Dict[str, List[Dict[str, str]]] = {t: [] for t in TOPIC_METADATA}
+    st.session_state.responses_this_topic = 0
     st.session_state.finalized = False
     st.session_state.summary: Optional[str] = None
     st.session_state.csv_bytes: Optional[bytes] = None
     st.session_state.txt_bytes: Optional[bytes] = None
     st.session_state.pending_inputs: List[str] = []
     st.session_state.processing_stage: str = "idle"
-    st.session_state.topic_last_response: Dict[str, str] = {}
-    st.session_state.no_more_questions = False
-
-
-def conversation_history() -> Sequence[Dict[str, str]]:
-    return st.session_state.llm_history
+    st.session_state.interview_complete = False
 
 
 # ---------- HELPERS ----------
@@ -166,80 +75,125 @@ def append_assistant_message(content: str) -> None:
     st.session_state.llm_history.append(message)
 
 
-def user_wants_to_stop(user_text: str) -> bool:
-    lowered = user_text.strip().lower()
-    return lowered in STOP_REQUESTS
+def current_topic_id() -> Optional[str]:
+    idx = st.session_state.current_topic_index
+    if idx < len(TOPIC_SEQUENCE):
+        return TOPIC_SEQUENCE[idx]
+    return None
 
 
-def user_requests_next(user_text: str) -> bool:
-    lowered = re.sub(r"[.!?]+$", "", user_text).strip().lower()
-    return lowered in SKIP_PATTERNS
-
-
-def response_is_repeat(topic_id: Optional[str], user_text: str) -> bool:
-    if not topic_id:
-        return False
-    previous = st.session_state.topic_last_response.get(topic_id)
-    if not previous:
-        return False
-    normalized = re.sub(r"\s+", " ", user_text.strip().lower())
-    prev_normalized = re.sub(r"\s+", " ", previous.strip().lower())
-    if normalized == prev_normalized:
-        return True
-    if normalized in {"same", "same thing"}:
-        return True
-    return False
-
-
-def needs_followup(topic_id: Optional[str], user_text: str) -> bool:
-    if not topic_id:
-        return False
-    words = user_text.strip().split()
-    if len(words) <= 8:
-        return True
-    lowered = user_text.strip().lower()
-    if any(phrase in lowered for phrase in GENERIC_PHRASES):
-        return True
-    return False
-
-
-def pick_topic_question(topic_id: str) -> str:
-    templates = TOPIC_QUESTION_BANK.get(topic_id, [])
+def get_interview_prompt() -> str:
     name = st.session_state.employee_name
-    if not templates:
-        return f"What else has stood out about working with {name}?"
-    return random.choice(templates).format(name=name)
+    persona = st.session_state.persona
+    current_topic = current_topic_id()
+    
+    if not current_topic:
+        return f"""You are conducting a performance review interview. The participant is a {persona} giving feedback about {name}.
+
+You've covered all main topics. Ask if there's anything else important to share about {name}, then wrap up warmly."""
+
+    topic_label = TOPIC_METADATA[current_topic]["label"]
+    responses_so_far = st.session_state.responses_this_topic
+    
+    base_prompt = f"""You are conducting a performance review interview. The participant is a {persona} giving feedback about {name}.
+
+Current topic: {topic_label}
+Responses received on this topic: {responses_so_far}
+
+INSTRUCTIONS:
+- Be conversational, warm, and professional
+- If the user's response is vague or very brief (under 10 words), ask ONE follow-up question to get a concrete example
+- If the user's response is detailed and specific, acknowledge it warmly and decide:
+  * If you have good insights on this topic (after 1-2 exchanges), move to the next topic
+  * If their response warrants one more clarifying question, ask it
+- When moving to a new topic, clearly signal the transition
+- Reference specific things they said to show you're listening
+- Never ask more than 1 follow-up question per user response
+
+If the user says "next", "move on", "skip", or similar - respect that and transition immediately."""
+
+    return base_prompt
 
 
-def pick_followup_question(topic_id: str) -> str:
-    templates = FOLLOWUP_QUESTION_BANK.get(topic_id, [])
+def generate_llm_response(client: OpenAI, user_text: str) -> tuple[str, bool, str]:
+    """
+    Returns: (assistant_response, should_move_to_next_topic, topic_notes)
+    """
+    system_prompt = get_interview_prompt()
+    
+    # Build conversation history
+    history = list(st.session_state.llm_history)
+    history.append({"role": "user", "content": user_text})
+    
+    # Add decision-making instruction
+    current_topic = current_topic_id()
+    if current_topic:
+        decision_prompt = f"""After responding, decide if you have enough information about {TOPIC_METADATA[current_topic]['label']} to move on.
+
+Respond with JSON:
+{{
+    "response": "your conversational response here",
+    "move_to_next_topic": true/false,
+    "key_insights": "brief summary of what you learned from this response"
+}}
+
+Set move_to_next_topic to true if:
+- You have 1-2 good specific examples or insights on this topic
+- The user explicitly asks to move on
+- You've had 3+ exchanges on this topic
+
+Set it to false if:
+- This is the first response and it's vague/brief
+- You need one clarifying example"""
+    else:
+        decision_prompt = """The interview is wrapping up. Respond warmly and thank them.
+
+Respond with JSON:
+{
+    "response": "your conversational response",
+    "move_to_next_topic": false,
+    "key_insights": "any final thoughts"
+}"""
+    
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                *history[:-1],  # All history except last user message
+                {"role": "user", "content": f"{user_text}\n\n{decision_prompt}"}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.7,
+        )
+        
+        result = json.loads(r.choices[0].message.content)
+        response = result.get("response", "Thanks for sharing that.")
+        should_move = result.get("move_to_next_topic", False)
+        insights = result.get("key_insights", user_text)
+        
+        return response, should_move, insights
+        
+    except Exception as e:
+        # Fallback
+        return "Thanks for sharing that. What else can you tell me?", False, user_text
+
+
+def start_new_topic(client: OpenAI) -> Optional[str]:
+    """Start the next topic with a clear introduction"""
+    idx = st.session_state.current_topic_index
+    if idx >= len(TOPIC_SEQUENCE):
+        return None
+    
+    topic_id = TOPIC_SEQUENCE[idx]
     name = st.session_state.employee_name
-    if not templates:
-        return f"What's a moment that brings {name} to mind there?"
-    return random.choice(templates).format(name=name)
+    intro_template = TOPIC_METADATA[topic_id]["intro"]
+    intro = intro_template.format(name=name)
+    
+    # Ask LLM to generate a natural opening question for this topic
+    prompt = f"""{intro} Generate a natural, specific opening question about {name}'s {TOPIC_METADATA[topic_id]['label'].lower()}.
 
-
-def pick_opening_question() -> str:
-    name = st.session_state.employee_name
-    opening = random.choice(OPENING_QUESTION_BANK).format(name=name)
-    return f"Thanks for taking the time to share your perspective on {name}. {opening}"
-
-
-def pick_closing_question() -> str:
-    name = st.session_state.employee_name
-    return random.choice(CLOSING_PROMPTS).format(name=name)
-
-
-# ---------- LLM TRANSITIONS ----------
-def generate_natural_transition(client: OpenAI, user_response: str, next_question: str) -> str:
-    """Generate a natural acknowledgment + transition using the LLM"""
-    prompt = (
-        f"You are conducting a performance review interview. The interviewee just said: \"{user_response}\"\n\n"
-        f"Acknowledge what they said in 1 SHORT sentence (10-15 words max), then ask: \"{next_question}\"\n\n"
-        "Be warm and conversational. Reference something specific they mentioned. "
-        "Format: [brief acknowledgment]. [question]\n"
-        "Example: 'That leadership during the launch really stands out. How does she shape the team dynamic day-to-day?'"
-    )
+Make it conversational and specific - ask about recent examples or observable behaviors."""
     
     try:
         r = client.chat.completions.create(
@@ -248,71 +202,43 @@ def generate_natural_transition(client: OpenAI, user_response: str, next_questio
             max_tokens=100,
             temperature=0.7,
         )
-        return r.choices[0].message.content.strip()
+        question = r.choices[0].message.content.strip()
+        return f"{intro} {question}"
     except Exception:
-        # Fallback to simple transition
-        return f"That's helpful. {next_question}"
+        return f"{intro} What have you observed about {name} in this area?"
 
 
-def generate_simple_acknowledgment(client: OpenAI, user_response: str) -> str:
-    """Generate a brief, natural acknowledgment without a follow-up question"""
-    prompt = (
-        f"You are conducting a performance review interview. The interviewee just said: \"{user_response}\"\n\n"
-        "Acknowledge what they said in ONE brief, warm sentence (8-12 words). "
-        "Reference something specific they mentioned. Don't ask a question.\n"
-        "Examples: 'That collaborative instinct really comes through.', 'The timeline management piece is interesting.'"
+# ---------- EXPORT ----------
+def build_topic_csv(persona: str) -> bytes:
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["persona", "topic", "note_index", "key_insights", "verbatim_response"],
     )
-    
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
-            temperature=0.7,
-        )
-        return r.choices[0].message.content.strip()
-    except Exception:
-        return "That's really helpful context."
+    writer.writeheader()
+    for topic_id, meta in TOPIC_METADATA.items():
+        entries = st.session_state.topic_notes.get(topic_id, [])
+        if not entries:
+            writer.writerow({"persona": persona, "topic": meta["label"]})
+            continue
+        for index, entry in enumerate(entries, 1):
+            writer.writerow(
+                {
+                    "persona": persona,
+                    "topic": meta["label"],
+                    "note_index": index,
+                    "key_insights": entry.get("insights", ""),
+                    "verbatim_response": entry.get("verbatim", ""),
+                }
+            )
+    return buf.getvalue().encode()
 
 
-# ---------- ANALYSIS ----------
-def analyze_user_response(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
-    prompt = (
-        "Identify whether the response discusses strengths, collaboration, or growth areas for the employee. "
-        "Return JSON {\"topics\":[{\"topic_id\":\"strengths|collaboration|growth\",\"notes\":[\"...\"]}]}."
-    )
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_text},
-            ],
-            response_format={"type": "json_object"},
-        )
-        data = json.loads(r.choices[0].message.content)
-    except Exception:
-        data = {}
-    out: Dict[str, List[str]] = {}
-    for topic in data.get("topics", []):
-        tid = topic.get("topic_id")
-        if tid in TOPIC_METADATA:
-            out[tid] = [note.strip() for note in topic.get("notes", []) if note.strip()]
-    return out
+def build_transcript_txt() -> bytes:
+    lines = [f"{message['role'].upper()}: {message['content']}" for message in st.session_state.messages]
+    return ("\n".join(lines)).encode("utf-8")
 
 
-async def analyze_user_response_async(client: OpenAI, user_text: str) -> Dict[str, List[str]]:
-    return await asyncio.to_thread(analyze_user_response, client, user_text)
-
-
-def record_topic_notes(user_text: str, notes_by_topic: Dict[str, List[str]]) -> None:
-    for topic_id, notes in notes_by_topic.items():
-        st.session_state.topic_notes.setdefault(topic_id, []).append(
-            {"notes": notes, "verbatim": user_text}
-        )
-
-
-# ---------- SUMMARY ----------
 def generate_summary(client: OpenAI, persona: str) -> str:
     name = st.session_state.employee_name
     payload = [
@@ -341,127 +267,39 @@ def generate_summary(client: OpenAI, persona: str) -> str:
     return r.choices[0].message.content.strip()
 
 
-# ---------- EXPORT ----------
-def build_topic_csv(persona: str) -> bytes:
-    buf = io.StringIO()
-    writer = csv.DictWriter(
-        buf,
-        fieldnames=["persona", "topic", "note_index", "note_summary", "verbatim_response"],
-    )
-    writer.writeheader()
-    for topic_id, meta in TOPIC_METADATA.items():
-        entries = st.session_state.topic_notes.get(topic_id, [])
-        if not entries:
-            writer.writerow({"persona": persona, "topic": meta["label"]})
-            continue
-        for index, entry in enumerate(entries, 1):
-            writer.writerow(
-                {
-                    "persona": persona,
-                    "topic": meta["label"],
-                    "note_index": index,
-                    "note_summary": " | ".join(entry.get("notes", [])),
-                    "verbatim_response": entry.get("verbatim", ""),
-                }
-            )
-    return buf.getvalue().encode()
-
-
-def build_transcript_txt() -> bytes:
-    lines = [f"{message['role'].upper()}: {message['content']}" for message in st.session_state.messages]
-    return ("\n".join(lines)).encode("utf-8")
-
-
 # ---------- FLOW ----------
-def mark_topic_covered(topic_id: str) -> None:
-    st.session_state.covered_topics.add(topic_id)
-
-
-def next_uncovered_topic() -> Optional[str]:
-    for topic in TOPIC_SEQUENCE:
-        if topic not in st.session_state.covered_topics:
-            return topic
-    return None
-
-
 def handle_user_response(client: OpenAI, persona: str, user_text: str) -> None:
-    if st.session_state.finalized or st.session_state.no_more_questions:
+    if st.session_state.finalized or st.session_state.interview_complete:
         return
-
-    current_topic = st.session_state.last_topic
+    
+    current_topic = current_topic_id()
+    
+    # Generate LLM response and get decision
+    assistant_response, should_move, insights = generate_llm_response(client, user_text)
+    
+    # Record notes
     if current_topic:
-        st.session_state.topic_last_response[current_topic] = user_text
-
-    # Handle explicit stop requests
-    if user_wants_to_stop(user_text):
-        st.session_state.no_more_questions = True
-        st.session_state.awaiting_closing_reply = False
-        append_assistant_message("Understood. Thanks so much for sharing all of that - really helpful insights.")
-        return
-
-    # Analyze the response
-    notes = asyncio.run(analyze_user_response_async(client, user_text))
-    if notes:
-        record_topic_notes(user_text, notes)
-        for topic_id in notes:
-            mark_topic_covered(topic_id)
-
-    # If they talked about something off-topic, still capture it
-    if current_topic and current_topic not in notes:
-        st.session_state.topic_notes.setdefault(current_topic, []).append(
-            {"notes": [user_text.strip()], "verbatim": user_text}
-        )
-
-    # Handle explicit "move on" requests
-    if current_topic and user_requests_next(user_text):
-        mark_topic_covered(current_topic)
-        ack = generate_simple_acknowledgment(client, user_text)
-        append_assistant_message(ack)
-        st.session_state.last_topic = None
-    # Handle repetitive answers
-    elif current_topic and response_is_repeat(current_topic, user_text):
-        mark_topic_covered(current_topic)
-        append_assistant_message("Got it, I think we've captured that well.")
-        st.session_state.last_topic = None
-    # Consider a follow-up if answer is too brief (but only once per topic)
-    elif current_topic and not st.session_state.followups_sent[current_topic] and needs_followup(
-        current_topic, user_text
-    ):
-        followup = pick_followup_question(current_topic)
-        transition = generate_natural_transition(client, user_text, followup)
-        append_assistant_message(transition)
-        st.session_state.followups_sent[current_topic] = True
-        st.session_state.topic_attempts[current_topic] += 1
-        return
-    else:
-        # Move past current topic
-        if current_topic:
-            mark_topic_covered(current_topic)
-            st.session_state.last_topic = None
-
-    # Move to next topic
-    next_topic = next_uncovered_topic()
-    if next_topic:
-        question = pick_topic_question(next_topic)
-        transition = generate_natural_transition(client, user_text, question)
-        append_assistant_message(transition)
-        st.session_state.last_topic = next_topic
-        st.session_state.topic_attempts[next_topic] += 1
-        return
-
-    # All topics covered - ask closing question
-    if not st.session_state.awaiting_closing_reply:
-        closing = pick_closing_question()
-        transition = generate_natural_transition(client, user_text, closing)
-        append_assistant_message(transition)
-        st.session_state.awaiting_closing_reply = True
-        return
-
-    # Final wrap-up
-    ack = generate_simple_acknowledgment(client, user_text)
-    append_assistant_message(f"{ack} Really appreciate you taking the time.")
-    st.session_state.awaiting_closing_reply = False
-    st.session_state.no_more_questions = True
+        st.session_state.topic_notes[current_topic].append({
+            "insights": insights,
+            "verbatim": user_text
+        })
+        st.session_state.responses_this_topic += 1
+    
+    # Send assistant response
+    append_assistant_message(assistant_response)
+    
+    # Handle topic transition
+    if should_move:
+        st.session_state.current_topic_index += 1
+        st.session_state.responses_this_topic = 0
+        
+        # Start next topic or wrap up
+        new_topic_intro = start_new_topic(client)
+        if new_topic_intro:
+            append_assistant_message(new_topic_intro)
+        else:
+            # Interview complete
+            st.session_state.interview_complete = True
 
 
 def process_pending_inputs_if_ready(client: OpenAI, persona: str) -> tuple[bool, str]:
@@ -498,15 +336,19 @@ def main():
         or st.session_state.get("employee_name") != employee_name
     ):
         initialize_session(persona, employee_name)
-        opening = pick_opening_question()
-        append_assistant_message(opening)
-        st.session_state.last_topic = "strengths"
-        st.session_state.topic_attempts["strengths"] += 1
+        # Start first topic
+        opening = start_new_topic(client)
+        if opening:
+            append_assistant_message(opening)
 
     with st.sidebar:
         st.header("Topic Coverage")
-        for topic_id, meta in TOPIC_METADATA.items():
-            st.checkbox(meta["label"], value=topic_id in st.session_state.covered_topics, disabled=True)
+        for idx, topic_id in enumerate(TOPIC_SEQUENCE):
+            meta = TOPIC_METADATA[topic_id]
+            is_covered = idx < st.session_state.current_topic_index
+            is_current = idx == st.session_state.current_topic_index
+            label = f"{'✓ ' if is_covered else '▶ ' if is_current else ''}{meta['label']}"
+            st.checkbox(label, value=is_covered, disabled=True)
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
